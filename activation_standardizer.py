@@ -10,6 +10,8 @@ from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from torch.utils.tensorboard import SummaryWriter
+
 
 class ActivationStandardizer:
     """
@@ -38,6 +40,7 @@ class ActivationStandardizer:
         self._autoencoder: Optional[SparseAutoencoder] = None
         self._input_dim: Optional[int] = None
         self._latent_dim: Optional[int] = None
+        self._autoencoder_history: list[dict[str, float]] = []
 
     def fit(self, X: np.ndarray) -> "ActivationStandardizer":
         X = self._require_2d(X)
@@ -179,6 +182,7 @@ class ActivationStandardizer:
         ).to(self.device)
         self._autoencoder.load_state_dict(dict(state_dict))
         self._autoencoder.eval()
+        self._autoencoder_history = []
 
     def load_autoencoder_artifact(
         self,
@@ -229,10 +233,28 @@ class ActivationStandardizer:
         optimizer = torch.optim.Adam(self._autoencoder.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
         loss_fn = nn.MSELoss()
 
+        writer = None
+        log_dir = getattr(cfg, "log_dir", None)
+        if log_dir:
+            if SummaryWriter is None:
+                raise RuntimeError(
+                    "TensorBoard logging requested, but torch.utils.tensorboard is unavailable. "
+                    "Install the 'tensorboard' package to enable logging."
+                )
+            log_path = Path(log_dir)
+            log_path.mkdir(parents=True, exist_ok=True)
+            writer = SummaryWriter(log_dir=str(log_path))
+
+        track_history = bool(getattr(cfg, "track_history", True))
+        log_interval = max(1, int(getattr(cfg, "log_interval", 1)))
+        history_records: list[dict[str, float]] | None = [] if track_history else None
+        global_step = 0
+        total_samples = len(dataset)
+
         self._autoencoder.train()
         for epoch in range(cfg.epochs):
             epoch_loss = 0.0
-            for (batch,) in loader:
+            for batch_index, (batch,) in enumerate(loader):
                 batch = batch.to(self.device)
                 optimizer.zero_grad()
                 recon, latent = self._autoencoder(batch)
@@ -241,11 +263,39 @@ class ActivationStandardizer:
                 loss = mse + sparsity
                 loss.backward()
                 optimizer.step()
-                epoch_loss += loss.item() * batch.size(0)
+
+                loss_value = float(loss.item())
+                epoch_loss += loss_value * batch.size(0)
+
+                if history_records is not None:
+                    history_records.append(
+                        {"epoch": epoch, "batch": batch_index, "loss": loss_value}
+                    )
+                if writer and global_step % log_interval == 0:
+                    writer.add_scalar("autoencoder/batch_loss", loss_value, global_step)
+                global_step += 1
+
+            avg_loss = epoch_loss / total_samples if total_samples else float("nan")
+            if history_records is not None:
+                history_records.append(
+                    {"epoch": epoch, "batch": -1, "loss": float(avg_loss)}
+                )
+            if writer:
+                writer.add_scalar("autoencoder/epoch_loss", avg_loss, epoch)
             if cfg.verbose:
-                print(f"[Autoencoder] epoch={epoch+1}/{cfg.epochs} loss={epoch_loss / len(dataset):.6f}")
+                print(
+                    f"[Autoencoder] epoch={epoch+1}/{cfg.epochs} loss={avg_loss:.6f}"
+                )
+
+        if writer:
+            writer.flush()
+            writer.close()
 
         self._autoencoder.eval()
+        self._autoencoder_history = history_records or []
+
+    def get_autoencoder_history(self) -> list[dict[str, float]]:
+        return list(self._autoencoder_history)
 
     @staticmethod
     def _require_2d(X: np.ndarray) -> np.ndarray:
@@ -267,6 +317,9 @@ class AutoEncoderConfig:
     weight_decay: float = 1e-5
     activation: nn.Module = nn.ReLU()
     verbose: bool = False
+    log_dir: Optional[str] = None
+    log_interval: int = 10
+    track_history: bool = True
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "AutoEncoderConfig":
@@ -293,8 +346,29 @@ class AutoEncoderConfig:
             beta=float(data.get("beta", defaults.beta)),
             weight_decay=float(data.get("weight_decay", defaults.weight_decay)),
             activation=activation,
-            verbose=bool(data.get("verbose", defaults.verbose)),
+            verbose=cls._coerce_bool(data.get("verbose", defaults.verbose)),
+            log_dir=(
+                str(data["log_dir"])
+                if data.get("log_dir", defaults.log_dir) is not None
+                else None
+            ),
+            log_interval=int(data.get("log_interval", defaults.log_interval)),
+            track_history=cls._coerce_bool(
+                data.get("track_history", defaults.track_history)
+            ),
         )
+
+    @staticmethod
+    def _coerce_bool(value: object) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off"}
+        return bool(value)
 
 
 class SparseAutoencoder(nn.Module):

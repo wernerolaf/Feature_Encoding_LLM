@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Iterable
+from typing import Iterable, Optional
 
 import numpy as np
 import pandas as pd
@@ -84,8 +84,29 @@ def parse_args() -> argparse.Namespace:
         default="relu",
         help="Nonlinearity inside the autoencoder.",
     )
+    parser.add_argument(
+        "--log-dir",
+        default='artifacts/autoencoders',
+        help="Directory to store TensorBoard event files for autoencoder training.",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=10,
+        help="Log every N batches when --log-dir is set.",
+    )
+    parser.add_argument(
+        "--no-history",
+        action="store_true",
+        help="Disable keeping the full loss history in memory.",
+    )
+    parser.add_argument(
+        "--loss-history-dir",
+        default='artifacts/autoencoders',
+        help="If provided, write per-batch/epoch loss history CSVs to this directory.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
-    parser.add_argument("--output-dir", default="autoencoders", help="Directory for saved models.")
+    parser.add_argument("--output-dir", default="artifacts/autoencoders", help="Directory for saved models.")
     parser.add_argument("--verbose", action="store_true", help="Print autoencoder training loss.")
     return parser.parse_args()
 
@@ -115,6 +136,9 @@ def config_to_dict(cfg: AutoEncoderConfig) -> dict:
         "weight_decay": cfg.weight_decay,
         "activation": cfg.activation.__class__.__name__,
         "verbose": cfg.verbose,
+        "log_dir": cfg.log_dir,
+        "log_interval": cfg.log_interval,
+        "track_history": cfg.track_history,
     }
 
 
@@ -191,8 +215,10 @@ def collect_layer_activations(
 
         for layer in ordered_layers:
             idx = resolved_layers[layer]
-            vectors = hidden_states[idx][batch_idx, last_idx]
-            buckets[layer].append(vectors.cpu())
+            layer_states = hidden_states[idx]                # [batch, seq, hidden]
+            valid_tokens = attention_mask.bool()
+            token_activations = layer_states[valid_tokens]   # [batch*seq_valid, hidden]
+            buckets[layer].append(token_activations.cpu())
 
     return {layer: torch.cat(chunks, dim=0).numpy() for layer, chunks in buckets.items()}
 
@@ -203,6 +229,14 @@ def train_and_save_autoencoder(
     args: argparse.Namespace,
     device: torch.device,
 ) -> Path:
+    layer_log_dir: Optional[Path]
+    if args.log_dir:
+        layer_log_dir = Path(args.log_dir) / f"{sanitize_model_name(args.model_name)}_layer{layer}"
+    else:
+        layer_log_dir = None
+
+    track_history = not args.no_history or args.loss_history_dir is not None
+
     cfg = AutoEncoderConfig(
         hidden_dim=args.latent_dim,
         lr=args.lr,
@@ -212,6 +246,9 @@ def train_and_save_autoencoder(
         weight_decay=args.weight_decay,
         activation=ACTIVATION_FACTORIES[args.activation.lower()](),
         verbose=args.verbose,
+        log_dir=str(layer_log_dir) if layer_log_dir is not None else None,
+        log_interval=max(1, args.log_interval),
+        track_history=track_history,
     )
     standardizer = ActivationStandardizer(
         strategy="autoencoder",
@@ -219,6 +256,7 @@ def train_and_save_autoencoder(
         device=device,
     )
     standardizer.fit(activations)
+    history = standardizer.get_autoencoder_history()
 
     artifact = {
         "model_name": args.model_name,
@@ -234,6 +272,14 @@ def train_and_save_autoencoder(
     output_dir.mkdir(parents=True, exist_ok=True)
     output_path = output_dir / f"{sanitize_model_name(args.model_name)}_layer{layer}_autoencoder.pt"
     torch.save(artifact, output_path)
+
+    if args.loss_history_dir and history:
+        history_dir = Path(args.loss_history_dir)
+        history_dir.mkdir(parents=True, exist_ok=True)
+        history_path = history_dir / f"{sanitize_model_name(args.model_name)}_layer{layer}_loss.csv"
+        pd.DataFrame(history).to_csv(history_path, index=False)
+        print(f"Saved loss history to {history_path}")
+
     return output_path
 
 

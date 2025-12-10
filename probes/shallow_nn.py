@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -10,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from activation_standardizer import ActivationStandardizer
 from probes.base import BaseProbe
 
+from torch.utils.tensorboard import SummaryWriter
 
 class ShallowNNProbe(BaseProbe):
     def __init__(
@@ -23,6 +26,9 @@ class ShallowNNProbe(BaseProbe):
         lr: float = 1e-3,
         weight_decay: float = 0.0,
         device: Optional[torch.device] = None,
+        log_dir: Optional[str] = None,
+        log_interval: int = 10,
+        track_history: bool = False,
     ) -> None:
         super().__init__(standardizer=standardizer)
         self.hidden_dim = hidden_dim
@@ -32,9 +38,13 @@ class ShallowNNProbe(BaseProbe):
         self.lr = lr
         self.weight_decay = weight_decay
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.log_dir = Path(log_dir) if log_dir else None
+        self.log_interval = max(1, log_interval)
+        self.track_history = track_history
 
         self.model: Optional[nn.Module] = None
         self.loss_fn = nn.BCEWithLogitsLoss()
+        self._history: list[dict[str, float]] = []
 
     def _build_model(self, input_dim: int) -> None:
         self.model = nn.Sequential(
@@ -55,10 +65,27 @@ class ShallowNNProbe(BaseProbe):
             self._build_model(X_tensor.shape[1])
 
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay)
+        writer = None
+        if self.log_dir:
+            if SummaryWriter is None:
+                raise RuntimeError(
+                    "TensorBoard logging requested for ShallowNNProbe, but torch.utils.tensorboard is unavailable. "
+                    "Install the 'tensorboard' package to enable logging."
+                )
+            run_dir = self.log_dir / f"run_{int(time.time())}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            writer = SummaryWriter(log_dir=str(run_dir))
+
+        track_history = self.track_history
+        history_records: list[dict[str, float]] | None = [] if track_history else None
+        global_step = 0
+        total_samples = len(dataset)
+
         self.model.train()
 
-        for _ in range(self.epochs):
-            for batch_X, batch_y in loader:
+        for epoch in range(self.epochs):
+            epoch_loss = 0.0
+            for batch_index, (batch_X, batch_y) in enumerate(loader):
                 batch_X = batch_X.to(self.device)
                 batch_y = batch_y.to(self.device)
                 optimizer.zero_grad()
@@ -67,7 +94,32 @@ class ShallowNNProbe(BaseProbe):
                 loss.backward()
                 optimizer.step()
 
+                loss_value = float(loss.item())
+                epoch_loss += loss_value * batch_X.size(0)
+
+                if history_records is not None:
+                    history_records.append(
+                        {"epoch": epoch, "batch": batch_index, "loss": loss_value}
+                    )
+                if writer and global_step % self.log_interval == 0:
+                    writer.add_scalar("probe/batch_loss", loss_value, global_step)
+                global_step += 1
+
+            avg_loss = epoch_loss / total_samples if total_samples else float("nan")
+            if history_records is not None:
+                history_records.append({"epoch": epoch, "batch": -1, "loss": float(avg_loss)})
+            if writer:
+                writer.add_scalar("probe/epoch_loss", avg_loss, epoch)
+
+        if writer:
+            writer.flush()
+            writer.close()
+
         self.model.eval()
+        self._history = history_records or []
+
+    def get_history(self) -> list[dict[str, float]]:
+        return list(self._history)
 
     def _predict_model(self, X: np.ndarray) -> np.ndarray:
         probs = self._predict_proba_model(X)[:, 1]

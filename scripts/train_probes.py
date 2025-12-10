@@ -8,7 +8,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, classification_report
+from sklearn.metrics import accuracy_score, classification_report, mean_squared_error, r2_score
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -78,6 +78,12 @@ def parse_args() -> argparse.Namespace:
         default="standard",
         help="Feature-normalisation strategy.",
     )
+    parser.add_argument(
+        "--task",
+        choices=["classification", "regression", "auto"],
+        default="auto",
+        help="Training objective. 'auto' picks regression for float labels; classification otherwise.",
+    )
     parser.add_argument("--autoencoder-artifact", help="Path to a saved autoencoder (required when strategy=autoencoder).")
     parser.add_argument("--no-standard-mean", action="store_true", help="Disable mean centering when using the StandardScaler.")
     parser.add_argument("--no-standard-std", action="store_true", help="Disable variance scaling when using the StandardScaler.")
@@ -98,7 +104,39 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--nn-batch-size", type=int, default=64, help="Batch size for the shallow NN probe.")
     parser.add_argument("--nn-lr", type=float, default=1e-3, help="Learning rate for the shallow NN probe.")
     parser.add_argument("--nn-weight-decay", type=float, default=0.0, help="Weight decay for the shallow NN probe.")
-    parser.add_argument("--save-path", help="Optional path to persist the trained probe with metadata (joblib).")
+    parser.add_argument(
+        "--probe-log-dir",
+        default=None,
+        help="Directory to store TensorBoard logs for probe training (shallow_nn only).",
+    )
+    parser.add_argument(
+        "--probe-log-interval",
+        type=int,
+        default=10,
+        help="Log every N batches for probe training when --probe-log-dir is set.",
+    )
+    parser.add_argument(
+        "--probe-track-history",
+        action="store_true",
+        help="Keep per-batch loss history of the probe in memory (useful for CSV export).",
+    )
+    parser.add_argument(
+        "--probe-history-dir",
+        default=None,
+        help="If provided, save probe loss history CSVs here (shallow_nn only).",
+    )
+    parser.add_argument(
+        "--save-path",
+        help=(
+            "Path to persist the trained probe artifact. "
+            "Defaults to artifacts/probes/<model>_layer<idx>_<probe>.pkl."
+        ),
+    )
+    parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Disable saving the trained probe artifact.",
+    )
     return parser.parse_args()
 
 
@@ -111,6 +149,24 @@ def resolve_device(spec: str) -> torch.device:
 def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
     np.random.seed(seed)
+
+
+def sanitize_model_name(name: str) -> str:
+    return name.replace("/", "_")
+
+
+def detect_task(label_series: pd.Series, user_choice: str) -> str:
+    """
+    Decide whether to run a classification or regression probe.
+    - If the user specifies classification/regression, honour it.
+    - If auto: treat float dtypes as regression; otherwise default to classification.
+    """
+    if user_choice in {"classification", "regression"}:
+        return user_choice
+
+    if pd.api.types.is_float_dtype(label_series):
+        return "regression"
+    return "classification"
 
 
 def build_text_series(df: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.Series, pd.DataFrame]:
@@ -150,7 +206,7 @@ def prepare_dataset(df: pd.DataFrame, args: argparse.Namespace) -> tuple[list[st
         text_series = text_series.iloc[: args.max_samples]
         label_series = label_series.iloc[: args.max_samples]
 
-    return text_series.tolist(), label_series.to_numpy()
+    return text_series.tolist(), label_series
 
 
 def collect_layer_activations(
@@ -167,6 +223,7 @@ def collect_layer_activations(
 
     buckets: list[torch.Tensor] = []
     resolved_idx: int | None = None
+    token_counts: list[int] = []
 
     model.to(device)
     model.eval()
@@ -193,15 +250,17 @@ def collect_layer_activations(
                     f"Layer {layer} resolves to {resolved_idx}, but only {total} hidden states are available."
                 )
 
+        layer_states = hidden_states[resolved_idx]         # [batch, seq, hidden]
         attention_mask = enc.get("attention_mask")
         if attention_mask is None:
             raise ValueError("Tokenizer did not return an attention_mask.")
-        last_idx = torch.clamp(attention_mask.sum(dim=1) - 1, min=0)
-        batch_idx = torch.arange(last_idx.size(0), device=device)
-        vectors = hidden_states[resolved_idx][batch_idx, last_idx]
-        buckets.append(vectors.cpu())
 
-    return torch.cat(buckets, dim=0).numpy()
+        valid_tokens = attention_mask.bool()               # [batch, seq]
+        token_counts.extend(valid_tokens.sum(dim=1).cpu().tolist())
+        token_activations = layer_states[valid_tokens]     # [batch*seq_valid, hidden]
+        buckets.append(token_activations.cpu())
+
+    return torch.cat(buckets, dim=0).numpy(), token_counts
 
 
 def make_standardizer(args: argparse.Namespace, device: torch.device) -> ActivationStandardizer:
@@ -222,7 +281,22 @@ def make_standardizer(args: argparse.Namespace, device: torch.device) -> Activat
     return standardizer
 
 
-def make_probe(args: argparse.Namespace, standardizer: ActivationStandardizer, device: torch.device):
+def make_probe(
+    args: argparse.Namespace,
+    standardizer: ActivationStandardizer,
+    device: torch.device,
+    *,
+    task: str,
+):
+    probe_log_dir = None
+    if args.probe_log_dir:
+        probe_log_dir = Path(args.probe_log_dir) / (
+            f"{sanitize_model_name(args.model_name)}_layer{args.layer}_{args.probe_type}"
+        )
+
+    track_history = args.probe_track_history or args.probe_history_dir is not None
+    log_interval = max(1, args.probe_log_interval)
+
     if args.probe_type == "linear":
         logistic_kwargs: dict[str, object] = {}
         if args.logistic_penalty:
@@ -231,13 +305,22 @@ def make_probe(args: argparse.Namespace, standardizer: ActivationStandardizer, d
             logistic_kwargs["C"] = args.logistic_C
         if args.logistic_max_iter is not None:
             logistic_kwargs["max_iter"] = args.logistic_max_iter
-        return LinearProbe(standardizer=standardizer, logistic_kwargs=logistic_kwargs or None)
+        return LinearProbe(
+            standardizer=standardizer,
+            logistic_kwargs=logistic_kwargs or None,
+            task=task,
+        )
 
     if args.probe_type == "decision_tree":
+        if task == "regression":
+            raise ValueError("DecisionTreeProbe currently supports classification only.")
         tree_kwargs: dict[str, object] = {"random_state": args.tree_random_state}
         if args.tree_max_depth is not None:
             tree_kwargs["max_depth"] = args.tree_max_depth
         return DecisionTreeProbe(standardizer=standardizer, tree_kwargs=tree_kwargs)
+
+    if task == "regression":
+        raise ValueError("ShallowNNProbe currently supports classification only.")
 
     return ShallowNNProbe(
         standardizer=standardizer,
@@ -248,6 +331,9 @@ def make_probe(args: argparse.Namespace, standardizer: ActivationStandardizer, d
         lr=args.nn_lr,
         weight_decay=args.nn_weight_decay,
         device=device,
+        log_dir=str(probe_log_dir) if probe_log_dir is not None else None,
+        log_interval=log_interval,
+        track_history=track_history,
     )
 
 
@@ -266,12 +352,17 @@ def main() -> None:
     )
 
     df = pd.read_excel(args.data_path, sheet_name=args.sheet)
-    texts, labels = prepare_dataset(df, args)
+    texts, label_series = prepare_dataset(df, args)
 
-    label_encoder = LabelEncoder()
-    y = label_encoder.fit_transform(labels)
+    task = detect_task(label_series, args.task)
+    label_encoder: LabelEncoder | None = None
+    if task == "classification":
+        label_encoder = LabelEncoder()
+        y = label_encoder.fit_transform(label_series.to_numpy())
+    else:
+        y = label_series.to_numpy(dtype=np.float32)
 
-    activations = collect_layer_activations(
+    activations, token_counts = collect_layer_activations(
         texts=texts,
         model=model,
         tokenizer=tokenizer,
@@ -280,6 +371,8 @@ def main() -> None:
         device=device,
         max_length=args.max_length,
     )
+
+    y = np.repeat(y, token_counts)
 
     X_train, X_test, y_train, y_test = train_test_split(
         activations,
@@ -290,37 +383,93 @@ def main() -> None:
     )
 
     standardizer = make_standardizer(args, device=device)
-    probe = make_probe(args, standardizer=standardizer, device=device)
+    probe = make_probe(args, standardizer=standardizer, device=device, task=task)
 
     probe.fit(X_train, y_train)
     train_pred = probe.predict(X_train)
     test_pred = probe.predict(X_test)
 
-    print(f"Train accuracy: {accuracy_score(y_train, train_pred):.4f}")
-    print(f"Test accuracy:  {accuracy_score(y_test, test_pred):.4f}")
-    print(classification_report(y_test, test_pred, target_names=label_encoder.classes_))
+    if task == "classification":
+        print(f"Train accuracy: {accuracy_score(y_train, train_pred):.4f}")
+        print(f"Test accuracy:  {accuracy_score(y_test, test_pred):.4f}")
+        if label_encoder is not None:
+            print(classification_report(y_test, test_pred, target_names=label_encoder.classes_))
+    else:
+        train_mse = mean_squared_error(y_train, train_pred)
+        test_mse = mean_squared_error(y_test, test_pred)
+        train_r2 = r2_score(y_train, train_pred)
+        test_r2 = r2_score(y_test, test_pred)
+        print(f"Train MSE: {train_mse:.4f}  R2: {train_r2:.4f}")
+        print(f"Test  MSE: {test_mse:.4f}  R2: {test_r2:.4f}")
 
-    if args.save_path:
-        save_path = Path(args.save_path)
+    if args.probe_history_dir:
+        history_dir = Path(args.probe_history_dir)
+        if hasattr(probe, "get_history"):
+            history = probe.get_history()  # type: ignore[attr-defined]
+            if history:
+                history_dir.mkdir(parents=True, exist_ok=True)
+                history_path = history_dir / (
+                    f"{sanitize_model_name(args.model_name)}_layer{args.layer}_{args.probe_type}_loss.csv"
+                )
+                pd.DataFrame(history).to_csv(history_path, index=False)
+                print(f"Saved probe loss history to {history_path}")
+            else:
+                print("Probe did not record loss history; nothing saved.")
+        else:
+            print(
+                f"Probe type '{args.probe_type}' does not expose a loss history; skipping CSV export."
+            )
+
+    save_path = None
+    if not args.no_save:
+        if args.save_path:
+            save_path = Path(args.save_path)
+        else:
+            default_dir = Path("artifacts/probes")
+            default_dir.mkdir(parents=True, exist_ok=True)
+            filename = f"{sanitize_model_name(args.model_name)}_layer{args.layer}_{args.probe_type}_{args.label_column}.pkl"
+            save_path = default_dir / filename
+
+    if save_path:
         save_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if hasattr(probe, "model") and getattr(probe, "model", None) is not None:
-            probe.model.cpu()
-        if hasattr(probe.standardizer, "_autoencoder") and probe.standardizer._autoencoder is not None:
-            probe.standardizer._autoencoder.cpu()
+        model_attr = getattr(probe, "model", None)
+        if model_attr is not None and hasattr(model_attr, "cpu"):
+            model_attr.cpu()
 
-        artifact = {
-            "probe_type": args.probe_type,
-            "model_name": args.model_name,
-            "layer": args.layer,
-            "standardizer_strategy": probe.standardizer.strategy,
-            "label_encoder": label_encoder,
-            "classes": label_encoder.classes_,
-            "probe": probe,
-            "autoencoder_artifact": args.autoencoder_artifact,
-        }
-        joblib.dump(artifact, save_path)
-        print(f"Saved probe artifact to {save_path}")
+        standardizer_metadata = None
+        standardizer_ref = getattr(probe, "standardizer", None)
+
+        if standardizer_ref is not None:
+            if hasattr(standardizer_ref, "_autoencoder") and standardizer_ref._autoencoder is not None:
+                standardizer_ref._autoencoder.cpu()
+
+            standardizer_metadata = {
+                "strategy": standardizer_ref.strategy,
+                "autoencoder_artifact": args.autoencoder_artifact,
+            }
+
+            if standardizer_ref.strategy == "standard" and getattr(standardizer_ref, "_scaler", None) is not None:
+                standardizer_metadata["scaler_state"] = standardizer_ref._scaler
+
+        try:
+            probe.standardizer = None
+
+            artifact = {
+                "probe_type": args.probe_type,
+                "model_name": args.model_name,
+                "layer": args.layer,
+                "standardizer": standardizer_metadata,
+                "label_encoder": label_encoder,
+                "classes": label_encoder.classes_ if label_encoder is not None else None,
+                "probe": probe,
+                "target_feature": args.label_column,
+                "task": task,
+            }
+            joblib.dump(artifact, save_path)
+            print(f"Saved probe artifact to {save_path}")
+        finally:
+            probe.standardizer = standardizer_ref
 
 
 if __name__ == "__main__":
