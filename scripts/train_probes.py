@@ -312,15 +312,10 @@ def make_probe(
         )
 
     if args.probe_type == "decision_tree":
-        if task == "regression":
-            raise ValueError("DecisionTreeProbe currently supports classification only.")
         tree_kwargs: dict[str, object] = {"random_state": args.tree_random_state}
         if args.tree_max_depth is not None:
             tree_kwargs["max_depth"] = args.tree_max_depth
-        return DecisionTreeProbe(standardizer=standardizer, tree_kwargs=tree_kwargs)
-
-    if task == "regression":
-        raise ValueError("ShallowNNProbe currently supports classification only.")
+        return DecisionTreeProbe(standardizer=standardizer, tree_kwargs=tree_kwargs, task=task)
 
     return ShallowNNProbe(
         standardizer=standardizer,
@@ -334,6 +329,7 @@ def make_probe(
         log_dir=str(probe_log_dir) if probe_log_dir is not None else None,
         log_interval=log_interval,
         track_history=track_history,
+        task=task,
     )
 
 

@@ -29,8 +29,13 @@ class ShallowNNProbe(BaseProbe):
         log_dir: Optional[str] = None,
         log_interval: int = 10,
         track_history: bool = False,
+        task: str = "classification",
     ) -> None:
         super().__init__(standardizer=standardizer)
+        task_normalized = task.lower()
+        if task_normalized not in {"classification", "regression"}:
+            raise ValueError("ShallowNNProbe task must be 'classification' or 'regression'.")
+        self.task = task_normalized
         self.hidden_dim = hidden_dim
         self.dropout = dropout
         self.epochs = epochs
@@ -43,7 +48,10 @@ class ShallowNNProbe(BaseProbe):
         self.track_history = track_history
 
         self.model: Optional[nn.Module] = None
-        self.loss_fn = nn.BCEWithLogitsLoss()
+        if self.task == "classification":
+            self.loss_fn = nn.BCEWithLogitsLoss()
+        else:
+            self.loss_fn = nn.MSELoss()
         self._history: list[dict[str, float]] = []
 
     def _build_model(self, input_dim: int) -> None:
@@ -90,7 +98,10 @@ class ShallowNNProbe(BaseProbe):
                 batch_y = batch_y.to(self.device)
                 optimizer.zero_grad()
                 logits = self.model(batch_X)
-                loss = self.loss_fn(logits, batch_y)
+                if self.task == "classification":
+                    loss = self.loss_fn(logits, batch_y)
+                else:
+                    loss = self.loss_fn(logits, batch_y)
                 loss.backward()
                 optimizer.step()
 
@@ -122,10 +133,18 @@ class ShallowNNProbe(BaseProbe):
         return list(self._history)
 
     def _predict_model(self, X: np.ndarray) -> np.ndarray:
-        probs = self._predict_proba_model(X)[:, 1]
-        return (probs >= 0.5).astype(int)
+        if self.task == "classification":
+            probs = self._predict_proba_model(X)[:, 1]
+            return (probs >= 0.5).astype(int)
+
+        tensor = torch.from_numpy(X).float().to(self.device)
+        with torch.no_grad():
+            outputs = self.model(tensor).cpu().numpy().reshape(-1)
+        return outputs
 
     def _predict_proba_model(self, X: np.ndarray) -> np.ndarray:
+        if self.task != "classification":
+            raise RuntimeError("predict_proba is not available for regression probes.")
         tensor = torch.from_numpy(X).float().to(self.device)
         with torch.no_grad():
             logits = self.model(tensor)
@@ -147,7 +166,10 @@ class ShallowNNProbe(BaseProbe):
         tensor.requires_grad_(True)
 
         logits = model(tensor)
-        score = torch.sigmoid(logits)
-        score.backward()
+        if self.task == "classification":
+            score = torch.sigmoid(logits)
+        else:
+            score = logits
+        score.backward(torch.ones_like(score))
         grad = tensor.grad.detach().cpu().numpy()
         return grad

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
-from sklearn.tree import DecisionTreeClassifier
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 
 from activation_standardizer import ActivationStandardizer
 from probes.base import BaseProbe
@@ -13,12 +13,20 @@ class DecisionTreeProbe(BaseProbe):
         *,
         standardizer: ActivationStandardizer | None = None,
         tree_kwargs: dict | None = None,
+        task: str = "classification",
     ) -> None:
         super().__init__(standardizer=standardizer)
+        task_normalized = task.lower()
+        if task_normalized not in {"classification", "regression"}:
+            raise ValueError("DecisionTreeProbe task must be 'classification' or 'regression'.")
+        self.task = task_normalized
         cfg = dict(max_depth=None, random_state=0)
         if tree_kwargs:
             cfg.update(tree_kwargs)
-        self.model = DecisionTreeClassifier(**cfg)
+        if self.task == "classification":
+            self.model = DecisionTreeClassifier(**cfg)
+        else:
+            self.model = DecisionTreeRegressor(**cfg)
         self._explainer = None
         self._train_X: np.ndarray | None = None
 
@@ -36,6 +44,8 @@ class DecisionTreeProbe(BaseProbe):
         return self.model.predict(X)
 
     def _predict_proba_model(self, X: np.ndarray) -> np.ndarray:
+        if self.task == "regression":
+            raise RuntimeError("predict_proba is not available for regression probes.")
         return self.model.predict_proba(X)
 
     def _compute_gradient(self, X: np.ndarray | None) -> np.ndarray:
@@ -56,48 +66,54 @@ class DecisionTreeProbe(BaseProbe):
             data = np.asarray(X)
 
         shap_vals = self._explainer.shap_values(data)
-        values = self._select_positive_class_shap(shap_vals)
+        values = self._select_shap_values(shap_vals)
 
         if X is None:
             return values.mean(axis=0)
         return values
 
         # ------------------------------------------------------------------ #
-    def _select_positive_class_shap(self, shap_vals) -> np.ndarray:
-        n_classes = getattr(self.model, "n_classes_", getattr(self.model, "classes_", [None]))
-        if isinstance(n_classes, int):
-            total_classes = n_classes
-        elif isinstance(n_classes, np.ndarray):
-            total_classes = n_classes.size
-        else:
-            total_classes = len(self.model.classes_)
-
-        target_class = 1 if total_classes > 1 else 0
-        values = shap_vals
-
-        if isinstance(values, list):
-            values = values[target_class]
-        else:
+    def _select_shap_values(self, shap_vals) -> np.ndarray:
+        if self.task == "regression":
+            values = shap_vals[0] if isinstance(shap_vals, list) else np.asarray(shap_vals)
             values = np.asarray(values)
-
-        if values.ndim == 3:
-            if values.shape[0] == total_classes:
-                values = values[target_class]
-            elif values.shape[1] == total_classes:
-                values = values[:, target_class, :]
-            elif values.shape[2] == total_classes:
-                values = values[:, :, target_class]
+            if values.ndim == 1:
+                values = values.reshape(1, -1)
+        else:
+            n_classes = getattr(self.model, "n_classes_", getattr(self.model, "classes_", [None]))
+            if isinstance(n_classes, int):
+                total_classes = n_classes
+            elif isinstance(n_classes, np.ndarray):
+                total_classes = n_classes.size
             else:
-                raise ValueError(
-                    f"Unexpected SHAP value shape {values.shape}; "
-                    f"cannot locate class axis of length {total_classes}."
-                )
+                total_classes = len(self.model.classes_)
 
-        if values.ndim == 1:
-            values = values.reshape(1, -1)
+            target_class = 1 if total_classes > 1 else 0
+            values = shap_vals
+
+            if isinstance(values, list):
+                values = values[target_class]
+            else:
+                values = np.asarray(values)
+
+            if values.ndim == 3:
+                if values.shape[0] == total_classes:
+                    values = values[target_class]
+                elif values.shape[1] == total_classes:
+                    values = values[:, target_class, :]
+                elif values.shape[2] == total_classes:
+                    values = values[:, :, target_class]
+                else:
+                    raise ValueError(
+                        f"Unexpected SHAP value shape {values.shape}; "
+                        f"cannot locate class axis of length {total_classes}."
+                    )
+
+            if values.ndim == 1:
+                values = values.reshape(1, -1)
 
         if values.ndim != 2:
-            raise ValueError(f"SHAP values must be 2D after class selection; got {values.shape}.")
+            raise ValueError(f"SHAP values must be 2D after selection; got {values.shape}.")
 
         expected_features = self._train_X.shape[1] if self._train_X is not None else values.shape[1]
         if values.shape[1] != expected_features:

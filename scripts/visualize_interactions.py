@@ -124,7 +124,18 @@ def plot_gradient_cosines(df: pd.DataFrame, out_dir: Path) -> None:
     save_plot(fig, out_dir / "gradient_cosines_lines.png")
 
 
-def process_split(exp_dir: Path, out_dir: Path, split: str, layers: Sequence[int] | None = None) -> None:
+def _safe_sheet_name(name: str) -> str:
+    """Excel limits sheet names to 31 characters."""
+    return name[:31]
+
+
+def process_split(
+    exp_dir: Path,
+    out_dir: Path,
+    split: str,
+    layers: Sequence[int] | None = None,
+    excel_writer: pd.ExcelWriter | None = None,
+) -> None:
     layer_list: list[int | None] = list(layers) if layers else [None]
     for layer in layer_list:
         suffix = f"_L{layer}" if layer is not None else ""
@@ -139,6 +150,16 @@ def process_split(exp_dir: Path, out_dir: Path, split: str, layers: Sequence[int
         merged_path = out_dir / f"token_stats_merged_{split}{suffix}.csv"
         merged.to_csv(merged_path, index=False)
 
+        if excel_writer is not None:
+            merged.to_excel(excel_writer, sheet_name=_safe_sheet_name(f"token_{split}{suffix}"), index=False)
+            prompt_delta = merged.groupby("prompt_index")["delta_logprob"].mean().reset_index()
+            prompt_delta = prompt_delta.sort_values("prompt_index")
+            prompt_delta.to_excel(
+                excel_writer,
+                sheet_name=_safe_sheet_name(f"prompt_delta_{split}{suffix}"),
+                index=False,
+            )
+
         tag = f"{split}{suffix}"
         plot_token_delta_hist(merged, out_dir, tag=tag)
         plot_prompt_bar(merged, out_dir, tag=tag)
@@ -146,7 +167,9 @@ def process_split(exp_dir: Path, out_dir: Path, split: str, layers: Sequence[int
         plot_feature_pred_deltas(merged, out_dir, tag=tag, pred_cols=pred_cols)
 
 
-def plot_logprob_summary(exp_dir: Path, out_dir: Path, split: str) -> None:
+def plot_logprob_summary(
+    exp_dir: Path, out_dir: Path, split: str, excel_writer: pd.ExcelWriter | None = None
+) -> None:
     base_path = exp_dir / f"logprob_stats_baseline_{split}.csv"
     int_path = exp_dir / f"logprob_stats_intervention_{split}.csv"
     base_df = load_csv(base_path)
@@ -158,6 +181,9 @@ def plot_logprob_summary(exp_dir: Path, out_dir: Path, split: str) -> None:
     merged["delta_mean_logprob"] = merged["mean_logprob_int"] - merged["mean_logprob_base"]
     merged["delta_mean_entropy"] = merged["mean_entropy_int"] - merged["mean_entropy_base"]
     merged.to_csv(out_dir / f"logprob_stats_merged_{split}.csv", index=False)
+
+    if excel_writer is not None:
+        merged.to_excel(excel_writer, sheet_name=_safe_sheet_name(f"logprob_{split}"), index=False)
 
     fig, ax = plt.subplots(figsize=(9, 4))
     ax.bar(merged["prompt_index"], merged["delta_mean_logprob"], width=0.8)
@@ -180,11 +206,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize probe intervention outputs (new format).")
     parser.add_argument("--experiment-dir", required=True, help="Directory with token/logprob stats and gradient_cosines.csv")
     parser.add_argument("--output-dir", default=None, help="Where to write plots/merged CSVs (default=experiment dir)")
+    parser.add_argument(
+        "--excel-out",
+        default=None,
+        help="Optional path to write an Excel workbook containing merged stats (token/prompt/logprob).",
+    )
     args = parser.parse_args()
 
     exp_dir = Path(args.experiment_dir)
     out_dir = Path(args.output_dir) if args.output_dir else exp_dir
     out_dir.mkdir(parents=True, exist_ok=True)
+    excel_writer = pd.ExcelWriter(args.excel_out) if args.excel_out else None
 
     layers: list[int] = []
     meta_path = exp_dir / "metadata.json"
@@ -204,13 +236,23 @@ def main() -> None:
             print(f"[warn] Could not parse layers from metadata: {exc}")
 
     for split in ("new", "old"):
-        process_split(exp_dir, out_dir, split, layers=layers if layers else None)
-        plot_logprob_summary(exp_dir, out_dir, split)
+        process_split(
+            exp_dir,
+            out_dir,
+            split,
+            layers=layers if layers else None,
+            excel_writer=excel_writer,
+        )
+        plot_logprob_summary(exp_dir, out_dir, split, excel_writer=excel_writer)
 
     grad_path = exp_dir / "gradient_cosines.csv"
     grad_df = load_csv(grad_path)
     if grad_df is not None:
         plot_gradient_cosines(grad_df, out_dir)
+
+    if excel_writer is not None:
+        excel_writer.close()
+        print(f"Wrote Excel workbook to {args.excel_out}")
 
     print(f"Saved visualizations to {out_dir}")
 
