@@ -23,6 +23,13 @@ from scripts.train_probes import (
     sanitize_model_name,
     set_seeds,
 )
+from utils import (
+    artifact_version_dir,
+    load_table,
+    next_version_dir,
+    save_json,
+    sha256_file,
+)
 
 InterventionMode = Literal["increase", "decrease", "project"]
 
@@ -179,11 +186,24 @@ def load_probe_artifact(
     mode: InterventionMode,
     strength: float,
 ) -> FeatureProbeContext:
-    candidates = [
-        Path(args.probe_dir)
-        / f"{sanitize_model_name(args.model_name)}_layer{layer}_{args.probe_type}_{label}.pkl",
-        Path(args.probe_dir) / f"pythia70m_L{layer}_{label}.pkl",  # legacy naming fallback
-    ]
+    candidates: list[Path] = []
+    version_dir = artifact_version_dir(
+        kind="probes",
+        model_name=args.model_name,
+        layer=layer,
+        label=label,
+        base_dir=args.probe_dir,
+        version="latest",
+    )
+    if version_dir:
+        candidates.append(version_dir / "probe.pkl")
+    candidates.extend(
+        [
+            Path(args.probe_dir)
+            / f"{sanitize_model_name(args.model_name)}_layer{layer}_{args.probe_type}_{label}.pkl",
+            Path(args.probe_dir) / f"pythia70m_L{layer}_{label}.pkl",  # legacy naming fallback
+        ]
+    )
     path = next((p for p in candidates if p.exists()), None)
     if path is None:
         raise FileNotFoundError(f"Missing probe artifact for '{label}'. Tried: {', '.join(str(p) for p in candidates)}")
@@ -293,11 +313,11 @@ class ProbeInterventionHook:
                 desired_sign = 1.0 if ctx.mode == "increase" else -1.0
                 tol = 1e-5  # treat tiny negatives as noise
                 flipped = bool(ctx.mode in {"increase", "decrease"} and delta_pos * desired_sign < -tol)
-                flip_snapshot = None
-                if flipped:
-                    snapshot_path = Path(self.output_dir) / f"direction_flip_layer{self.layer_idx}_step{self.step}_{ctx.name}.npy"
-                    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-                    np.save(snapshot_path, flat_np)
+                # flip_snapshot = None
+                # if flipped:
+                #     snapshot_path = Path(self.output_dir) / f"direction_flip_layer{self.layer_idx}_step{self.step}_{ctx.name}.npy"
+                #     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+                #     np.save(snapshot_path, flat_np)
 
                 ctx.analytics.append(
                     {
@@ -427,6 +447,7 @@ def run_generation(
     contexts_by_layer: dict[int, list[FeatureProbeContext]],
     device: torch.device,
     args: argparse.Namespace,
+    out_dir: Path,
     generate_new_tokens: bool = True,
     hook_active: bool = True,
 ):
@@ -436,7 +457,7 @@ def run_generation(
     if contexts_by_layer:
         for layer_idx, ctxs in contexts_by_layer.items():
             module = resolve_layer_module(model, layer_idx)
-            intervention_hook = ProbeInterventionHook(ctxs, layer_idx=layer_idx, output_dir=Path(args.output_dir))
+            intervention_hook = ProbeInterventionHook(ctxs, layer_idx=layer_idx, output_dir=out_dir)
             intervention_hook.active = hook_active
             hooks.append(module.register_forward_hook(intervention_hook))
 
@@ -820,18 +841,34 @@ def save_metadata(
     args: argparse.Namespace,
     feature_specs: list[FeatureSpec],
     layers: list[int],
+    *,
+    data_hash: str | None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     meta = {
+        "artifact_type": "experiment",
+        "experiment_name": args.experiment_name,
         "model_name": args.model_name,
         "layers": layers,
         "probe_dir": args.probe_dir,
         "probe_type": args.probe_type,
         "data_path": args.data_path,
+        "data_hash": data_hash,
         "sheet": args.sheet,
         "features": [spec.__dict__ for spec in feature_specs],
+        "dtype": args.dtype,
+        "seed": args.seed,
+        "max_samples": args.max_samples,
+        "generation": {
+            "max_new_tokens": args.max_new_tokens,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "do_sample": args.do_sample,
+            "generation_batch_size": args.generation_batch_size,
+        },
+        "args": vars(args),
     }
-    (output_dir / "metadata.json").write_text(json.dumps(meta, indent=2))
+    save_json(meta, output_dir / "metadata.json")
 
 
 def parse_args() -> argparse.Namespace:
@@ -849,7 +886,14 @@ def parse_args() -> argparse.Namespace:
                         help="Format: label_column[:mode[:strength]]. Mode ∈ {increase,decrease,project}.")
     parser.add_argument("--probe-type", choices=["linear", "decision_tree", "shallow_nn"], default="linear",
                         help="Probe type used in artifact naming (no training happens here).")
-    parser.add_argument("--output-dir", default="artifacts/experiments")
+    parser.add_argument("--output-dir", default="artifacts/experiments", help="Base directory for experiment outputs.")
+    parser.add_argument("--experiment-name", default="feature_interaction", help="Name used for versioned experiment directory.")
+    parser.add_argument(
+        "--version",
+        type=int,
+        default=None,
+        help="Optional explicit version number; otherwise next version is created.",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--seed", type=int, default=0)
@@ -868,6 +912,13 @@ def main() -> None:
     args = parse_args()
     set_seeds(args.seed)
     device = resolve_device(args.device)
+    out_dir = next_version_dir(
+        kind="experiments",
+        model_name=args.model_name,
+        label=args.experiment_name,
+        base_dir=args.output_dir,
+        version_override=args.version,
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)
     if tokenizer.pad_token is None:
@@ -879,7 +930,8 @@ def main() -> None:
     model.to(device)
     model.eval()
 
-    df = pd.read_excel(args.data_path, sheet_name=args.sheet)
+    df = load_table(args.data_path, sheet=args.sheet)
+    data_hash = sha256_file(args.data_path)
     text_series, filtered_df = build_text_series(df, args)  # includes responses when available
 
     feature_specs = parse_feature_specs(args.feature_specs)
@@ -919,6 +971,7 @@ def main() -> None:
         contexts_by_layer=contexts_by_layer,
         device=device,
         args=args,
+        out_dir=out_dir,
         generate_new_tokens=False,
         hook_active=False,
     )
@@ -931,6 +984,7 @@ def main() -> None:
         contexts_by_layer=contexts_by_layer,
         device=device,
         args=args,
+        out_dir=out_dir,
         generate_new_tokens=False,
         hook_active=True,
     )
@@ -943,6 +997,7 @@ def main() -> None:
         contexts_by_layer=contexts_by_layer,
         device=device,
         args=args,
+        out_dir=out_dir,
         generate_new_tokens=True,
         hook_active=False,
     )
@@ -955,11 +1010,11 @@ def main() -> None:
         contexts_by_layer=contexts_by_layer,
         device=device,
         args=args,
+        out_dir=out_dir,
         generate_new_tokens=True,
         hook_active=True,
     )
 
-    out_dir = Path(args.output_dir)
     layer_items = sorted(contexts_by_layer.items(), key=lambda kv: kv[0])
     for layer_idx, layer_contexts in layer_items:
         suffix = f"_L{layer_idx}"
@@ -1028,7 +1083,7 @@ def main() -> None:
         )
 
     save_generations(
-        Path(args.output_dir),
+        out_dir,
         gen_prompts,
         baseline_generations,
         generations,
@@ -1036,9 +1091,9 @@ def main() -> None:
         logprobs,
         tag="intervention_new",
     )
-    save_logprob_batches(Path(args.output_dir), intervened_stats, tag="intervention_new")
+    save_logprob_batches(out_dir, intervened_stats, tag="intervention_new")
     save_generations(
-        Path(args.output_dir),
+        out_dir,
         full_texts,
         [""] * len(full_texts),  # neutral has no new tokens
         neutral_generations,
@@ -1046,9 +1101,9 @@ def main() -> None:
         neutral_logprobs,
         tag="baseline_old",
     )
-    save_logprob_batches(Path(args.output_dir), neutral_stats, tag="baseline_old")
+    save_logprob_batches(out_dir, neutral_stats, tag="baseline_old")
     save_generations(
-        Path(args.output_dir),
+        out_dir,
         full_texts,
         [""] * len(full_texts),  # active old answers
         active_generations,
@@ -1056,9 +1111,9 @@ def main() -> None:
         active_logprobs,
         tag="intervention_old",
     )
-    save_logprob_batches(Path(args.output_dir), active_stats, tag="intervention_old")
+    save_logprob_batches(out_dir, active_stats, tag="intervention_old")
     save_generations(
-        Path(args.output_dir),
+        out_dir,
         gen_prompts,
         baseline_generations,
         baseline_generations,
@@ -1066,11 +1121,11 @@ def main() -> None:
         baseline_logprobs,
         tag="baseline_new",
     )
-    save_logprob_batches(Path(args.output_dir), baseline_stats, tag="baseline_new")
+    save_logprob_batches(out_dir, baseline_stats, tag="baseline_new")
     all_cos = cos_records + neutral_cos + active_cos + baseline_cos
-    save_gradient_cosines(Path(args.output_dir), all_cos)
-    save_probe_analytics(Path(args.output_dir), contexts_by_layer)
-    save_metadata(Path(args.output_dir), args, feature_specs, sorted(layers))
+    save_gradient_cosines(out_dir, all_cos)
+    save_probe_analytics(out_dir, contexts_by_layer)
+    save_metadata(out_dir, args, feature_specs, sorted(layers), data_hash=data_hash)
     for prompt, generation in zip(gen_prompts, generations):
         print("=" * 80)
         print(prompt)

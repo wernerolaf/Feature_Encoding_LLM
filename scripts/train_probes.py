@@ -15,6 +15,17 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from activation_standardizer import ActivationStandardizer
 from probes import DecisionTreeProbe, LinearProbe, ShallowNNProbe
+from utils import (
+    build_probe_metadata,
+    ensure_dir,
+    load_table,
+    next_version_dir,
+    resolve_device,
+    save_json,
+    set_seeds,
+    sha256_file,
+    sanitize_model_name,
+)
 
 PROMPT_TEMPLATE = (
     "you want to convince your {gender} interlocutor with a {level} level of {trait}, "
@@ -133,26 +144,22 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--artifact-root",
+        default="artifacts/probes",
+        help="Base directory for saving probes when --save-path is not provided.",
+    )
+    parser.add_argument(
+        "--version",
+        type=int,
+        default=None,
+        help="Optional explicit version number for the artifact. Defaults to the next available version.",
+    )
+    parser.add_argument(
         "--no-save",
         action="store_true",
         help="Disable saving the trained probe artifact.",
     )
     return parser.parse_args()
-
-
-def resolve_device(spec: str) -> torch.device:
-    if spec == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(spec)
-
-
-def set_seeds(seed: int) -> None:
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-
-def sanitize_model_name(name: str) -> str:
-    return name.replace("/", "_")
 
 
 def detect_task(label_series: pd.Series, user_choice: str) -> str:
@@ -347,7 +354,8 @@ def main() -> None:
         torch_dtype=DTYPE_MAP[args.dtype],
     )
 
-    df = pd.read_excel(args.data_path, sheet_name=args.sheet)
+    df = load_table(args.data_path, sheet=args.sheet)
+    data_hash = sha256_file(args.data_path)
     texts, label_series = prepare_dataset(df, args)
 
     task = detect_task(label_series, args.task)
@@ -384,11 +392,17 @@ def main() -> None:
     probe.fit(X_train, y_train)
     train_pred = probe.predict(X_train)
     test_pred = probe.predict(X_test)
+    metrics: dict[str, object] = {}
 
     if task == "classification":
-        print(f"Train accuracy: {accuracy_score(y_train, train_pred):.4f}")
-        print(f"Test accuracy:  {accuracy_score(y_test, test_pred):.4f}")
+        train_acc = accuracy_score(y_train, train_pred)
+        test_acc = accuracy_score(y_test, test_pred)
+        print(f"Train accuracy: {train_acc:.4f}")
+        print(f"Test accuracy:  {test_acc:.4f}")
+        metrics.update({"train_accuracy": float(train_acc), "test_accuracy": float(test_acc)})
         if label_encoder is not None:
+            class_report = classification_report(y_test, test_pred, target_names=label_encoder.classes_, output_dict=True)
+            metrics["classification_report"] = class_report
             print(classification_report(y_test, test_pred, target_names=label_encoder.classes_))
     else:
         train_mse = mean_squared_error(y_train, train_pred)
@@ -397,6 +411,14 @@ def main() -> None:
         test_r2 = r2_score(y_test, test_pred)
         print(f"Train MSE: {train_mse:.4f}  R2: {train_r2:.4f}")
         print(f"Test  MSE: {test_mse:.4f}  R2: {test_r2:.4f}")
+        metrics.update(
+            {
+                "train_mse": float(train_mse),
+                "test_mse": float(test_mse),
+                "train_r2": float(train_r2),
+                "test_r2": float(test_r2),
+            }
+        )
 
     if args.probe_history_dir:
         history_dir = Path(args.probe_history_dir)
@@ -416,18 +438,25 @@ def main() -> None:
                 f"Probe type '{args.probe_type}' does not expose a loss history; skipping CSV export."
             )
 
-    save_path = None
+    artifact_dir: Path | None = None
+    artifact_path: Path | None = None
     if not args.no_save:
         if args.save_path:
-            save_path = Path(args.save_path)
+            artifact_path = Path(args.save_path)
+            artifact_dir = artifact_path.parent
         else:
-            default_dir = Path("artifacts/probes")
-            default_dir.mkdir(parents=True, exist_ok=True)
-            filename = f"{sanitize_model_name(args.model_name)}_layer{args.layer}_{args.probe_type}_{args.label_column}.pkl"
-            save_path = default_dir / filename
+            artifact_dir = next_version_dir(
+                kind="probes",
+                model_name=args.model_name,
+                layer=args.layer,
+                label=args.label_column,
+                base_dir=args.artifact_root,
+                version_override=args.version,
+            )
+            artifact_path = artifact_dir / "probe.pkl"
 
-    if save_path:
-        save_path.parent.mkdir(parents=True, exist_ok=True)
+    if artifact_path and artifact_dir:
+        ensure_dir(artifact_dir)
 
         model_attr = getattr(probe, "model", None)
         if model_attr is not None and hasattr(model_attr, "cpu"):
@@ -462,8 +491,25 @@ def main() -> None:
                 "target_feature": args.label_column,
                 "task": task,
             }
-            joblib.dump(artifact, save_path)
-            print(f"Saved probe artifact to {save_path}")
+            joblib.dump(artifact, artifact_path)
+            metrics_path = artifact_dir / "metrics.json"
+            save_json(metrics, metrics_path)
+
+            classes = label_encoder.classes_.tolist() if label_encoder is not None else None
+            metadata = build_probe_metadata(
+                args=args,
+                layer=args.layer,
+                label_column=args.label_column,
+                task=task,
+                standardizer_strategy=standardizer_metadata["strategy"] if standardizer_metadata else "identity",
+                autoencoder_artifact=args.autoencoder_artifact,
+                artifact_path=artifact_path,
+                data_hash=data_hash,
+                metrics=metrics,
+                classes=classes,
+            )
+            save_json(metadata, artifact_dir / "metadata.json")
+            print(f"Saved probe artifact to {artifact_path}")
         finally:
             probe.standardizer = standardizer_ref
 

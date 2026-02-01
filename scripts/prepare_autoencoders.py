@@ -12,6 +12,17 @@ from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from activation_standardizer import ActivationStandardizer, AutoEncoderConfig
+from utils import (
+    build_autoencoder_metadata,
+    ensure_dir,
+    load_table,
+    next_version_dir,
+    resolve_device,
+    sanitize_model_name,
+    save_json,
+    set_seeds,
+    sha256_file,
+)
 
 PROMPT_TEMPLATE = (
     "you want to convince your {gender} interlocutor with a {level} level of {trait}, "
@@ -38,7 +49,7 @@ def parse_args() -> argparse.Namespace:
         description="Train sparse autoencoders on hidden states from a causal language model."
     )
     parser.add_argument("--model-name", required=True, help="Hugging Face model id.")
-    parser.add_argument("--data-path", required=True, help="Path to the Excel workbook.")
+    parser.add_argument("--data-path", required=True, help="Path to the data file (csv/tsv/xlsx).")
     parser.add_argument("--sheet", required=True, help="Worksheet name to read.")
     parser.add_argument("--text-column", default=None, help="Use this column directly if present.")
     parser.add_argument(
@@ -85,15 +96,15 @@ def parse_args() -> argparse.Namespace:
         help="Nonlinearity inside the autoencoder.",
     )
     parser.add_argument(
-        "--log-dir",
-        default='artifacts/autoencoders',
-        help="Directory to store TensorBoard event files for autoencoder training.",
-    )
-    parser.add_argument(
         "--log-interval",
         type=int,
         default=10,
         help="Log every N batches when --log-dir is set.",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Directory to store TensorBoard event files for autoencoder training (optional).",
     )
     parser.add_argument(
         "--no-history",
@@ -102,28 +113,19 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--loss-history-dir",
-        default='artifacts/autoencoders',
-        help="If provided, write per-batch/epoch loss history CSVs to this directory.",
+        default=None,
+        help="If provided, write per-batch/epoch loss history CSVs to this directory. Defaults to version directory.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
-    parser.add_argument("--output-dir", default="artifacts/autoencoders", help="Directory for saved models.")
+    parser.add_argument("--output-dir", default="artifacts/autoencoders", help="Base directory for saved models.")
+    parser.add_argument(
+        "--version",
+        type=int,
+        default=None,
+        help="Optional explicit version number for the artifact. Defaults to the next available version.",
+    )
     parser.add_argument("--verbose", action="store_true", help="Print autoencoder training loss.")
     return parser.parse_args()
-
-
-def resolve_device(spec: str) -> torch.device:
-    if spec == "auto":
-        return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    return torch.device(spec)
-
-
-def set_seeds(seed: int) -> None:
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-
-def sanitize_model_name(name: str) -> str:
-    return name.replace("/", "_")
 
 
 def config_to_dict(cfg: AutoEncoderConfig) -> dict:
@@ -226,14 +228,11 @@ def collect_layer_activations(
 def train_and_save_autoencoder(
     activations: np.ndarray,
     layer: int,
+    version_dir: Path,
     args: argparse.Namespace,
     device: torch.device,
-) -> Path:
-    layer_log_dir: Optional[Path]
-    if args.log_dir:
-        layer_log_dir = Path(args.log_dir) / f"{sanitize_model_name(args.model_name)}_layer{layer}"
-    else:
-        layer_log_dir = None
+) -> tuple[Path, Optional[Path]]:
+    tb_dir = version_dir / "tensorboard" if args.log_dir is not None else None
 
     track_history = not args.no_history or args.loss_history_dir is not None
 
@@ -246,7 +245,7 @@ def train_and_save_autoencoder(
         weight_decay=args.weight_decay,
         activation=ACTIVATION_FACTORIES[args.activation.lower()](),
         verbose=args.verbose,
-        log_dir=str(layer_log_dir) if layer_log_dir is not None else None,
+        log_dir=str(tb_dir) if tb_dir is not None else None,
         log_interval=max(1, args.log_interval),
         track_history=track_history,
     )
@@ -268,19 +267,21 @@ def train_and_save_autoencoder(
         "state_dict": standardizer._autoencoder.state_dict(),
     }
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_path = output_dir / f"{sanitize_model_name(args.model_name)}_layer{layer}_autoencoder.pt"
-    torch.save(artifact, output_path)
+    weights_path = version_dir / "ae_weights.pt"
+    ensure_dir(weights_path.parent)
+    torch.save(artifact, weights_path)
 
-    if args.loss_history_dir and history:
-        history_dir = Path(args.loss_history_dir)
-        history_dir.mkdir(parents=True, exist_ok=True)
-        history_path = history_dir / f"{sanitize_model_name(args.model_name)}_layer{layer}_loss.csv"
+    history_path = None
+    if history:
+        if args.loss_history_dir:
+            history_path = Path(args.loss_history_dir)
+        else:
+            history_path = version_dir / "loss.csv"
+        ensure_dir(history_path.parent)
         pd.DataFrame(history).to_csv(history_path, index=False)
         print(f"Saved loss history to {history_path}")
 
-    return output_path
+    return weights_path, history_path
 
 
 def main() -> None:
@@ -297,7 +298,8 @@ def main() -> None:
         torch_dtype=DTYPE_MAP[args.dtype],
     )
 
-    df = pd.read_excel(args.data_path, sheet_name=args.sheet)
+    df = load_table(args.data_path, sheet=args.sheet)
+    data_hash = sha256_file(args.data_path)
     texts = prepare_texts(df, args)
 
     activations_by_layer = collect_layer_activations(
@@ -311,10 +313,30 @@ def main() -> None:
     )
 
     for layer, activations in activations_by_layer.items():
-        path = train_and_save_autoencoder(activations, layer, args, device)
+        version_dir = next_version_dir(
+            kind="autoencoders",
+            model_name=args.model_name,
+            layer=layer,
+            base_dir=args.output_dir,
+            version_override=args.version,
+        )
+        weights_path, history_path = train_and_save_autoencoder(
+            activations, layer, version_dir, args, device
+        )
+        metadata = build_autoencoder_metadata(
+            args=args,
+            layer=layer,
+            input_dim=activations.shape[1],
+            latent_dim=args.latent_dim,
+            weights_path=weights_path,
+            loss_history_path=history_path,
+            data_hash=data_hash,
+            sample_count=activations.shape[0],
+        )
+        save_json(metadata, version_dir / "metadata.json")
         print(
             f"Layer {layer}: trained autoencoder on {activations.shape[0]} samples "
-            f"(input {activations.shape[1]}, latent {args.latent_dim}); saved to {path}"
+            f"(input {activations.shape[1]}, latent {args.latent_dim}); saved to {weights_path}"
         )
 
 
