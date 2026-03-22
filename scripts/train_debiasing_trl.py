@@ -20,6 +20,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DataCollatorForLan
 from transformers import BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
+from scripts.prompt_utils import PROMPT_TEMPLATE, build_prompt_from_row
+
 from utils import (
     build_debias_metadata,
     load_table,
@@ -29,12 +31,6 @@ from utils import (
     save_json,
     set_seeds,
     sha256_file,
-)
-
-PROMPT_TEMPLATE = (
-    "you want to convince your {gender} interlocutor with a {level} level of {trait}, "
-    'and answer "{belief}" to the question: "{question}". '
-    "Use {type} arguments to change {pronoun}'s mind.\n"
 )
 
 DTYPE_MAP = {
@@ -74,48 +70,11 @@ PRONOUN_SWAP = {
 }
 
 
-class SafeDict(dict):
-    def __missing__(self, key):
-        return ""
-
-
 @dataclass
 class DebiasExample:
     text: str
     origin: str
     gender: str | None
-
-
-def build_prompt(row, template: str, template_fields: Iterable[str]) -> str:
-    values = {field: row.get(field, "") for field in template_fields}
-    return template.format_map(SafeDict(values))
-
-
-def build_text(row, args) -> str:
-    if args.text_column and args.text_column in row.index:
-        return str(row.get(args.text_column, "")).strip()
-    prompt = build_prompt(row, args.prompt_template, args.template_fields)
-    response = str(row.get(args.response_column, "")) if args.response_column else ""
-    return f"{prompt}{args.prompt_response_sep}{response}".strip()
-
-
-def swap_terms(text: str, mapping: dict[str, str]) -> str:
-    import re
-
-    if not text or not mapping:
-        return text
-    pattern = re.compile(r"\b(" + "|".join(re.escape(k) for k in mapping.keys()) + r")\b", re.IGNORECASE)
-
-    def repl(match):
-        token = match.group(0)
-        replacement = mapping.get(token.lower(), token)
-        if token.isupper():
-            return replacement.upper()
-        if token[0].isupper():
-            return replacement.capitalize()
-        return replacement
-
-    return pattern.sub(repl, text)
 
 
 def swap_row(row, gender_col: str, pronoun_col: str | None = None):
@@ -134,24 +93,51 @@ def augment_with_gender_swaps(df, args):
     examples = []
     empty_rows = 0
     iter_df = df.iloc[: args.max_samples] if args.max_samples is not None else df
+
     for _, row in iter_df.iterrows():
-        base_text = build_text(row, args)
-        if not base_text.strip():
+        # This simplified mode assumes template-based prompt construction.
+        if args.text_column:
+            raise ValueError(
+                "Simplified debiasing requires prompt-template mode. "
+                "Do not pass --text-column."
+            )
+
+        prompt = build_prompt_from_row(
+            row,
+            args.prompt_template,
+            args.template_fields,
+        ).strip()
+        response = str(row.get(args.response_column, "")).strip()
+
+        if not prompt:
             empty_rows += 1
             continue
-        gender_val = str(row.get(args.gender_column, "")).strip().lower() or None
-        examples.append(DebiasExample(text=base_text, origin="original", gender=gender_val))
 
-        if args.swap_probability > 0 and random.random() <= args.swap_probability:
-            swapped_row = swap_row(row, gender_col=args.gender_column, pronoun_col=args.pronoun_column)
-            swapped_text = build_text(swapped_row, args)
-            if args.swap_response_text:
-                merged_map = {**GENDER_SWAP, **PRONOUN_SWAP}
-                swapped_text = swap_terms(swapped_text, merged_map)
-            if swapped_text.strip():
-                examples.append(
-                    DebiasExample(text=swapped_text, origin="swapped", gender=swapped_row.get(args.gender_column, None))
-                )
+        base_text = f"{prompt}{args.prompt_response_sep}{response}".strip()
+
+        swapped_row = swap_row(
+            row,
+            gender_col=args.gender_column,
+            pronoun_col=args.pronoun_column,
+        )
+        swapped_prompt = build_prompt_from_row(
+            swapped_row,
+            args.prompt_template,
+            args.template_fields,
+        ).strip()
+
+        if not swapped_prompt:
+            empty_rows += 1
+            continue
+
+        swapped_text = f"{swapped_prompt}{args.prompt_response_sep}{response}".strip()
+
+        gender_val = str(row.get(args.gender_column, "")).strip().lower() or None
+        swapped_gender_val = str(swapped_row.get(args.gender_column, "")).strip().lower() or None
+
+        examples.append(DebiasExample(text=base_text, origin="original", gender=gender_val))
+        examples.append(DebiasExample(text=swapped_text, origin="swapped_prompt", gender=swapped_gender_val))
+
     if empty_rows:
         print(f"Skipped {empty_rows} empty/blank rows during augmentation.")
     return examples
@@ -178,8 +164,6 @@ def parse_args():
     parser.add_argument("--response-column", default="response")
     parser.add_argument("--gender-column", default="gender")
     parser.add_argument("--pronoun-column", default="pronoun")
-    parser.add_argument("--swap-response-text", action="store_true")
-    parser.add_argument("--swap-probability", type=float, default=1.0)
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=2)

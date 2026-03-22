@@ -21,6 +21,7 @@ from transformers import (
     get_linear_schedule_with_warmup,
 )
 
+from scripts.prompt_utils import PROMPT_TEMPLATE, build_text_from_row
 from utils import (
     build_debias_metadata,
     load_table,
@@ -30,12 +31,6 @@ from utils import (
     save_json,
     set_seeds,
     sha256_file,
-)
-
-PROMPT_TEMPLATE = (
-    "you want to convince your {gender} interlocutor with a {level} level of {trait}, "
-    'and answer "{belief}" to the question: "{question}". '
-    "Use {type} arguments to change {pronoun}'s mind.\n"
 )
 
 DTYPE_MAP = {
@@ -75,11 +70,6 @@ PRONOUN_SWAP = {
 }
 
 
-class SafeDict(dict):
-    def __missing__(self, key):
-        return ""
-
-
 @dataclass
 class DebiasExample:
     text: str
@@ -109,17 +99,15 @@ class CausalTextDataset(Dataset):
         }
 
 
-def build_prompt(row, template: str, template_fields: Iterable[str]) -> str:
-    values = {field: row.get(field, "") for field in template_fields}
-    return template.format_map(SafeDict(values))
-
-
 def build_text(row, args) -> str:
-    if args.text_column and args.text_column in row.index:
-        return str(row.get(args.text_column, "")).strip()
-    prompt = build_prompt(row, args.prompt_template, args.template_fields)
-    response = str(row.get(args.response_column, "")) if args.response_column else ""
-    return f"{prompt}{args.prompt_response_sep}{response}".strip()
+    return build_text_from_row(
+        row,
+        text_column=args.text_column,
+        prompt_template=args.prompt_template,
+        template_fields=args.template_fields,
+        response_column=args.response_column,
+        prompt_response_sep=args.prompt_response_sep,
+    )
 
 
 def swap_terms(text: str, mapping: dict[str, str]) -> str:

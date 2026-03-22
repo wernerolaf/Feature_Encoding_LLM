@@ -12,6 +12,7 @@ from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from activation_standardizer import ActivationStandardizer, AutoEncoderConfig
+from scripts.prompt_utils import PROMPT_TEMPLATE, build_text_series
 from utils import (
     build_autoencoder_metadata,
     ensure_dir,
@@ -22,12 +23,7 @@ from utils import (
     save_json,
     set_seeds,
     sha256_file,
-)
-
-PROMPT_TEMPLATE = (
-    "you want to convince your {gender} interlocutor with a {level} level of {trait}, "
-    "and answer \"{belief}\" to the question: \"{question}\". "
-    "Use {type} arguments to change {pronoun}'s mind.\n"
+    resolve_artifact_label,
 )
 
 ACTIVATION_FACTORIES = {
@@ -116,6 +112,16 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="If provided, write per-batch/epoch loss history CSVs to this directory. Defaults to version directory.",
     )
+    parser.add_argument(
+    "--artifact-label",
+    default=None,
+    help="Optional label between layer and version dirs. Default: latent{latent_dim}",
+    )
+    parser.add_argument(
+        "--allow-overwrite",
+        action="store_true",
+        help="Allow overwriting existing artifact files.",
+    )
     parser.add_argument("--seed", type=int, default=0, help="Random seed.")
     parser.add_argument("--output-dir", default="artifacts/autoencoders", help="Base directory for saved models.")
     parser.add_argument(
@@ -145,22 +151,15 @@ def config_to_dict(cfg: AutoEncoderConfig) -> dict:
 
 
 def prepare_texts(df: pd.DataFrame, args: argparse.Namespace) -> list[str]:
-    if args.text_column and args.text_column in df.columns:
-        series = df[args.text_column]
-    else:
-        if not args.prompt_template:
-            raise ValueError("Provide --text-column or --prompt-template")
-        def render(row: pd.Series) -> str:
-            values = {field: row.get(field, "") for field in args.template_fields}
-            return args.prompt_template.format_map(values)
-        prompts = df.apply(render, axis=1)
-        if args.response_column and args.response_column in df.columns:
-            responses = df[args.response_column].fillna("").astype(str)
-            series = prompts + responses
-        else:
-            series = prompts
-    series = series.fillna("").astype(str).str.strip()
-    texts = [text for text in series.tolist() if text]
+    series, _ = build_text_series(
+        df,
+        text_column=args.text_column,
+        prompt_template=args.prompt_template,
+        template_fields=args.template_fields,
+        response_column=args.response_column,
+        prompt_response_sep="",
+    )
+    texts = series.tolist()
     if args.max_samples is not None:
         texts = texts[: args.max_samples]
     if not texts:
@@ -267,8 +266,12 @@ def train_and_save_autoencoder(
         "state_dict": standardizer._autoencoder.state_dict(),
     }
 
-    weights_path = version_dir / "ae_weights.pt"
-    ensure_dir(weights_path.parent)
+    weights_path = version_dir / f"ae_weights_latent{args.latent_dim}.pt"
+    if weights_path.exists() and not args.allow_overwrite:
+        raise FileExistsError(
+            f"Refusing to overwrite existing artifact: {weights_path}. "
+            "Pass --allow-overwrite to replace it."
+        )
     torch.save(artifact, weights_path)
 
     history_path = None
@@ -312,11 +315,14 @@ def main() -> None:
         max_length=args.max_length,
     )
 
+    artifact_label = resolve_artifact_label(args)
+
     for layer, activations in activations_by_layer.items():
         version_dir = next_version_dir(
             kind="autoencoders",
             model_name=args.model_name,
             layer=layer,
+            label=artifact_label,
             base_dir=args.output_dir,
             version_override=args.version,
         )

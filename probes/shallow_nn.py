@@ -46,6 +46,7 @@ class ShallowNNProbe(BaseProbe):
         self.log_dir = Path(log_dir) if log_dir else None
         self.log_interval = max(1, log_interval)
         self.track_history = track_history
+        self._pin_memory = self.device.type == "cuda"
 
         self.model: Optional[nn.Module] = None
         if self.task == "classification":
@@ -67,7 +68,7 @@ class ShallowNNProbe(BaseProbe):
         y_tensor = torch.from_numpy(y.astype(np.float32)).float().unsqueeze(-1)
 
         dataset = TensorDataset(X_tensor, y_tensor)
-        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False)
+        loader = DataLoader(dataset, batch_size=self.batch_size, shuffle=True, drop_last=False, pin_memory=self._pin_memory)
 
         if self.model is None:
             self._build_model(X_tensor.shape[1])
@@ -94,8 +95,8 @@ class ShallowNNProbe(BaseProbe):
         for epoch in range(self.epochs):
             epoch_loss = 0.0
             for batch_index, (batch_X, batch_y) in enumerate(loader):
-                batch_X = batch_X.to(self.device)
-                batch_y = batch_y.to(self.device)
+                batch_X = batch_X.to(self.device, non_blocking=self._pin_memory)
+                batch_y = batch_y.to(self.device, non_blocking=self._pin_memory)
                 optimizer.zero_grad()
                 logits = self.model(batch_X)
                 if self.task == "classification":
@@ -157,19 +158,36 @@ class ShallowNNProbe(BaseProbe):
         self.model.eval()
 
         if X is None:
-            return self._gradient_at_point(self.model, np.zeros(self.model[0].in_features))
-
-        return np.vstack([self._gradient_at_point(self.model, x) for x in X])
-
-    def _gradient_at_point(self, model: nn.Module, x: np.ndarray) -> np.ndarray:
-        tensor = torch.from_numpy(x.astype(np.float32)).to(self.device)
-        tensor.requires_grad_(True)
-
-        logits = model(tensor)
-        if self.task == "classification":
-            score = torch.sigmoid(logits)
+            X_work = np.zeros((1, self.model[0].in_features), dtype=np.float32)
+            squeeze = True
         else:
-            score = logits
-        score.backward(torch.ones_like(score))
-        grad = tensor.grad.detach().cpu().numpy()
-        return grad
+            X_work = np.asarray(X, dtype=np.float32)
+            if X_work.ndim == 1:
+                X_work = X_work.reshape(1, -1)
+                squeeze = True
+            elif X_work.ndim == 2:
+                squeeze = False
+            else:
+                raise ValueError("Expected activations to be 1D or 2D.")
+
+        grads: list[np.ndarray] = []
+        for start in range(0, X_work.shape[0], self.batch_size):
+            chunk = torch.from_numpy(X_work[start : start + self.batch_size]).to(
+                self.device,
+                non_blocking=self._pin_memory,
+            )
+            chunk.requires_grad_(True)
+            logits = self.model(chunk).reshape(-1)
+            if self.task == "classification":
+                score = torch.sigmoid(logits)
+            else:
+                score = logits
+            grad = torch.autograd.grad(score.sum(), chunk, retain_graph=False, create_graph=False)[0]
+            grads.append(grad.detach().cpu().numpy())
+
+        grad_arr = (
+            np.concatenate(grads, axis=0)
+            if grads
+            else np.empty((0, X_work.shape[1]), dtype=np.float32)
+        )
+        return grad_arr[0] if squeeze else grad_arr

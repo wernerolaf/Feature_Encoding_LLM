@@ -16,18 +16,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from activation_standardizer import ActivationStandardizer
 from probes import DecisionTreeProbe, LinearProbe, ShallowNNProbe
-from scripts.train_probes import (
-    PROMPT_TEMPLATE,
-    build_text_series,
-    resolve_device,
-    sanitize_model_name,
-    set_seeds,
-)
+from scripts.prompt_utils import PROMPT_TEMPLATE, build_prompt_series, build_text_series
 from utils import (
     artifact_version_dir,
     load_table,
     next_version_dir,
+    resolve_device,
+    sanitize_model_name,
     save_json,
+    set_seeds,
     sha256_file,
 )
 
@@ -60,22 +57,13 @@ def build_generation_prompts(df: pd.DataFrame, args: argparse.Namespace) -> list
     Build prompts for generation only (never appending responses) so saved prompts
     do not include ground-truth answers.
     """
-    if args.text_column and args.text_column in df.columns:
-        series = df[args.text_column]
-    else:
-        if not args.prompt_template:
-            raise ValueError("Provide --text-column or --prompt-template")
-
-        def render(row: pd.Series) -> str:
-            values = {field: row.get(field, "") for field in args.template_fields}
-            return args.prompt_template.format_map(values)
-
-        series = df.apply(render, axis=1)
-
-    series = series.fillna("").astype(str).str.strip()
-    mask = series != ""
-    prompts = series.loc[mask].tolist()
-    return prompts
+    series = build_prompt_series(
+        df,
+        text_column=args.text_column,
+        prompt_template=args.prompt_template,
+        template_fields=args.template_fields,
+    )
+    return series.tolist()
 
 
 @dataclass
@@ -282,7 +270,9 @@ class ProbeInterventionHook:
         total_adjustment = torch.zeros_like(flat)
 
         for ctx in self.contexts:
-            raw_gradients = ctx.probe.get_gradient(flat_np, normalize=False)
+            with torch.enable_grad():
+                raw_gradients = ctx.probe.get_gradient(flat_np, normalize=False)
+
             grad_source = "gradient"
             raw_norms = np.linalg.norm(raw_gradients, axis=1)
             ctx.analytics.append(
@@ -301,39 +291,6 @@ class ProbeInterventionHook:
             )
 
             grad_tensor = torch.from_numpy(raw_gradients).to(flat.device)
-
-            # Check that the raw gradient moves the positive class in the intended direction (diagnostics only).
-            pre_scores = None
-            try:
-                pre_scores = ctx.probe.predict_proba(flat_np)
-                pos_idx = 1 if pre_scores.ndim > 1 and pre_scores.shape[1] > 1 else 0
-                step_flat = flat_np + 10*raw_gradients
-                step_scores = ctx.probe.predict_proba(step_flat)
-                delta_pos = float(step_scores[:, pos_idx].mean() - pre_scores[:, pos_idx].mean())
-                desired_sign = 1.0 if ctx.mode == "increase" else -1.0
-                tol = 1e-5  # treat tiny negatives as noise
-                flipped = bool(ctx.mode in {"increase", "decrease"} and delta_pos * desired_sign < -tol)
-                # flip_snapshot = None
-                # if flipped:
-                #     snapshot_path = Path(self.output_dir) / f"direction_flip_layer{self.layer_idx}_step{self.step}_{ctx.name}.npy"
-                #     snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-                #     np.save(snapshot_path, flat_np)
-
-                ctx.analytics.append(
-                    {
-                        "step": self.step,
-                        "mode": ctx.mode,
-                        "strength": ctx.strength,
-                        "tag": "direction_check",
-                        "source": grad_source,
-                        "tokens_observed": int(raw_norms.shape[0]),
-                        "delta_pos": delta_pos,
-                        "flipped": flipped,
-                    }
-                )
-            except Exception as e:
-                # print(e)
-                pre_scores = None
 
             if self.active:
                 if ctx.mode == "increase":
@@ -470,10 +427,8 @@ def run_generation(
     all_entropy: list[np.ndarray] = []
     all_token_ids: list[np.ndarray] = []
     last_outputs = None
-    prompt_stats: list[dict[str, object]] = []
     per_token_preds: list[dict[str, list[float]]] = []
     batch_size = max(1, args.generation_batch_size)
-    prompt_idx = 0
     for start in range(0, len(prompts), batch_size):
         batch_prompts = prompts[start : start + batch_size]
         enc = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
@@ -501,23 +456,6 @@ def run_generation(
         lp, ent = compute_logprobs_and_entropy(outputs, generated_ids)
         all_logprobs.append(lp)
         all_entropy.append(ent)
-        # per-prompt stats for this batch
-        for b in range(lp.shape[0]):
-            mask = ~np.isnan(lp[b])
-            tokens = int(mask.sum())
-            mean_lp = float(np.nanmean(lp[b])) if tokens else ""
-            mean_prob = float(np.nanmean(np.exp(lp[b][mask]))) if tokens else ""
-            mean_ent = float(np.nanmean(ent[b])) if tokens else ""
-            prompt_stats.append(
-                {
-                    "prompt_index": prompt_idx,
-                    "mean_logprob": mean_lp,
-                    "mean_prob": mean_prob,
-                    "mean_entropy": mean_ent,
-                    "tokens": tokens,
-                }
-            )
-            prompt_idx += 1
         all_token_ids.extend(list(generated_ids.cpu().numpy()))
         if contexts_by_layer:
             # compute gradient cosines on this batch of hidden states
@@ -573,7 +511,7 @@ def run_generation(
 
                         # ensure per_token_preds has entries
                         pred_key = f"{ctx.name}_L{layer_idx}"
-                        while len(per_token_preds) < prompt_idx:
+                        while len(per_token_preds) < start + batch_size_cur:
                             per_token_preds.append({})
                         for bi in range(batch_size_cur):
                             idx_global = start + bi
@@ -585,9 +523,9 @@ def run_generation(
     for h in hooks:
         h.remove()
 
-    def pad_and_concat(arrs: list[np.ndarray]) -> tuple[np.ndarray | None, list[np.ndarray]]:
+    def pad_and_concat(arrs: list[np.ndarray]) -> np.ndarray | None:
         if not arrs:
-            return None, []
+            return None
         max_cols = max(arr.shape[1] for arr in arrs)
         padded = []
         for arr in arrs:
@@ -595,10 +533,10 @@ def run_generation(
                 pad_width = ((0, 0), (0, max_cols - arr.shape[1]))
                 arr = np.pad(arr, pad_width, constant_values=np.nan)
             padded.append(arr)
-        return np.concatenate(padded, axis=0), padded
+        return np.concatenate(padded, axis=0)
 
-    logprobs_concat, logprobs_padded = pad_and_concat(all_logprobs)
-    entropy_concat, entropy_padded = pad_and_concat(all_entropy)
+    logprobs_concat = pad_and_concat(all_logprobs)
+    entropy_concat = pad_and_concat(all_entropy)
     # ensure per_token_preds aligns with prompt count
     while len(per_token_preds) < len(prompts):
         per_token_preds.append({})
@@ -610,9 +548,6 @@ def run_generation(
         entropy_concat,
         all_token_ids,
         cos_records,
-        logprobs_padded,
-        entropy_padded,
-        prompt_stats,
         per_token_preds,
     )
 
@@ -621,100 +556,215 @@ def save_token_stats(
     output_dir: Path,
     tokenizer: AutoTokenizer,
     prompts: list[str],
-    intervened_token_ids: Optional[list[np.ndarray]] = None,
-    intervened_logprobs: Optional[np.ndarray] = None,
-    intervened_entropy: Optional[np.ndarray] = None,
-    baseline_token_ids: Optional[list[np.ndarray]] = None,
-    baseline_logprobs: Optional[np.ndarray] = None,
-    baseline_entropy: Optional[np.ndarray] = None,
+    token_ids: list[np.ndarray],
+    logprobs: Optional[np.ndarray],
+    entropy: Optional[np.ndarray],
+    *,
     contexts: Optional[list[FeatureProbeContext]] = None,
     token_preds: Optional[list[dict[str, list[float]]]] = None,
     tag: str = "token_stats",
     column_suffix: str = "",
-) -> None:
-    token_ids = intervened_token_ids or baseline_token_ids
-    logprob_arr = intervened_logprobs if intervened_logprobs is not None else baseline_logprobs
-    entropy_arr = intervened_entropy if intervened_entropy is not None else baseline_entropy
+    file_format: str = "parquet",   # "parquet" or "csv"
+    include_token_text: bool = False,
+    skip_special_tokens: bool = False,
+    chunk_size: int = 200_000,
+) -> Path:
+    """
+    Long-format token stats writer.
+    One row per (prompt_index, token_index, feature). If no features exist, one row per token.
+    """
+    import re
+    import math
+    import pandas as pd
 
-    if token_ids is None or logprob_arr is None:
-        return
-    class_stats_summary = {}
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Normalize format
+    fmt = file_format.lower().strip()
+    if fmt not in {"csv", "parquet"}:
+        raise ValueError("file_format must be 'csv' or 'parquet'.")
+
+    # Feature metadata from contexts
+    feature_meta: dict[str, dict[str, object]] = {}
     if contexts:
-        class_stats_summary = {
-            ctx.name: {
+        for ctx in contexts:
+            k = f"{ctx.name}{column_suffix}"
+            feature_meta[k] = {
                 "mode": ctx.mode,
-                "strength": ctx.strength,
-                "training_metrics": ctx.training_metrics,
-                "records": ctx.analytics,
+                "strength": float(ctx.strength),
                 "task": ctx.task,
             }
-            for ctx in contexts
-        }
-    output_dir.mkdir(parents=True, exist_ok=True)
-    token_stats_path = output_dir / f"{tag}.csv"
-    with token_stats_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        feature_names = sorted({f"{ctx.name}{column_suffix}" for ctx in contexts}) if contexts else []
-        if not feature_names and token_preds:
-            for entry in token_preds:
-                feature_names.extend(entry.keys())
-            feature_names = sorted(set(feature_names))
-        header = ["prompt_index", "token_index", "token", "logprob", "entropy"] + [f"pred_{name}" for name in feature_names]
-        writer.writerow(header)
-        eos_id = tokenizer.eos_token_id
-        pad_id = tokenizer.pad_token_id
-        special_tokens = set(tokenizer.all_special_tokens)
-        for i, (prompt, ids) in enumerate(zip(prompts, token_ids)):
-            lp_row = logprob_arr[i] if logprob_arr is not None and i < logprob_arr.shape[0] else None
-            ent_row = entropy_arr[i] if entropy_arr is not None and i < entropy_arr.shape[0] else None
 
-            max_len = len(ids)
-            if lp_row is not None:
-                max_len = min(max_len, lp_row.shape[0])
-            if ent_row is not None:
-                max_len = min(max_len, ent_row.shape[0])
+    # Feature keys also from predictions map
+    feature_names = set(feature_meta.keys())
+    if token_preds:
+        for entry in token_preds:
+            feature_names.update(entry.keys())
+    feature_names = sorted(feature_names)
 
-            for j in range(max_len):
-                token_id = int(ids[j])
-                token = tokenizer.convert_ids_to_tokens([token_id])[0]
-                if (eos_id is not None and token_id == eos_id) or (pad_id is not None and token_id == pad_id) or token in special_tokens:
-                    continue
-                lp_val = float(lp_row[j]) if lp_row is not None and j < len(lp_row) else ""
-                ent_val = float(ent_row[j]) if ent_row is not None and j < len(ent_row) else ""
-                row = [i, j, token, lp_val, ent_val]
-                if feature_names:
-                    preds_map = token_preds[i] if token_preds and i < len(token_preds) else {}
-                    for name in feature_names:
-                        vals = preds_map.get(name)
-                        val = vals[j] if vals and j < len(vals) else ""
-                        row.append(val)
-                writer.writerow(row)
+    # Try parquet writer (chunk-append)
+    parquet_writer = None
+    pa = None
+    pq = None
+    if fmt == "parquet":
+        try:
+            import pyarrow as pa  # type: ignore
+            import pyarrow.parquet as pq  # type: ignore
+        except Exception:
+            fmt = "csv"  # fallback
 
+    out_path = output_dir / f"{tag}.{fmt}"
+    if out_path.exists():
+        out_path.unlink()
 
-def save_probe_analytics(
-    output_dir: Path,
-    contexts_by_layer: dict[int, list[FeatureProbeContext]],
-) -> None:
-    if not contexts_by_layer:
-        return
-    output_dir.mkdir(parents=True, exist_ok=True)
-    payload: list[dict[str, object]] = []
-    for layer_idx, ctxs in sorted(contexts_by_layer.items(), key=lambda kv: kv[0]):
-        for ctx in ctxs:
-            payload.append(
-                {
-                    "layer": layer_idx,
-                    "name": ctx.name,
-                    "mode": ctx.mode,
-                    "strength": ctx.strength,
-                    "task": ctx.task,
-                    "class_names": ctx.class_names,
-                    "training_metrics": ctx.training_metrics,
-                    "records": ctx.analytics,
-                }
-            )
-    path = output_dir / "probe_analytics.json"
-    path.write_text(json.dumps(payload, indent=2))
+    token_cache: dict[int, str] = {}
+    all_special_ids = set(getattr(tokenizer, "all_special_ids", []) or [])
+    eos_id = tokenizer.eos_token_id
+    pad_id = tokenizer.pad_token_id
+    if eos_id is not None:
+        all_special_ids.add(int(eos_id))
+    if pad_id is not None:
+        all_special_ids.add(int(pad_id))
+
+    # Parse layer from feature key suffix "..._L<idx>"
+    layer_pat = re.compile(r"^(?P<name>.+)_L(?P<layer>-?\d+)$")
+
+    def split_feature_layer(feature_key: str) -> tuple[str, Optional[int]]:
+        m = layer_pat.match(feature_key)
+        if not m:
+            return feature_key, None
+        return m.group("name"), int(m.group("layer"))
+
+    columns = [
+        "tag",
+        "prompt_index",
+        "token_index",
+        "token_id",
+        "token_text",
+        "is_special",
+        "logprob",
+        "entropy",
+        "feature_key",
+        "feature_name",
+        "layer",
+        "mode",
+        "strength",
+        "task",
+        "pred",
+    ]
+
+    rows: list[tuple] = []
+    csv_header_written = False
+
+    def flush_rows() -> None:
+        nonlocal rows, parquet_writer, csv_header_written
+        if not rows:
+            return
+        df = pd.DataFrame.from_records(rows, columns=columns)
+
+        # keep storage compact
+        for c in ("logprob", "entropy", "strength", "pred"):
+            df[c] = df[c].astype("float32")
+        df["is_special"] = df["is_special"].astype("bool")
+        df["token_id"] = df["token_id"].astype("int32")
+        df["token_index"] = df["token_index"].astype("int32")
+        df["prompt_index"] = df["prompt_index"].astype("int32")
+        if not include_token_text:
+            df = df.drop(columns=["token_text"])
+
+        if fmt == "csv":
+            df.to_csv(out_path, mode="a", index=False, header=not csv_header_written)
+            csv_header_written = True
+        else:
+            table = pa.Table.from_pandas(df, preserve_index=False)
+            if parquet_writer is None:
+                parquet_writer = pq.ParquetWriter(str(out_path), table.schema, compression="zstd")
+            parquet_writer.write_table(table)
+
+        rows = []
+
+    n_prompts = min(len(prompts), len(token_ids))
+    for i in range(n_prompts):
+        ids = token_ids[i]
+        lp_row = logprobs[i] if (logprobs is not None and i < logprobs.shape[0]) else None
+        ent_row = entropy[i] if (entropy is not None and i < entropy.shape[0]) else None
+        preds_map = token_preds[i] if (token_preds is not None and i < len(token_preds)) else {}
+
+        max_len = len(ids)
+        if lp_row is not None:
+            max_len = min(max_len, int(lp_row.shape[0]))
+        if ent_row is not None:
+            max_len = min(max_len, int(ent_row.shape[0]))
+
+        for j in range(max_len):
+            tid = int(ids[j])
+            is_special = tid in all_special_ids
+            if skip_special_tokens and is_special:
+                continue
+
+            token_text = None
+            if include_token_text:
+                token_text = token_cache.get(tid)
+                if token_text is None:
+                    token_text = tokenizer.convert_ids_to_tokens([tid])[0]
+                    token_cache[tid] = token_text
+
+            lp_val = float(lp_row[j]) if lp_row is not None else math.nan
+            ent_val = float(ent_row[j]) if ent_row is not None else math.nan
+
+            if feature_names:
+                for fk in feature_names:
+                    vals = preds_map.get(fk)
+                    pred = float(vals[j]) if (vals is not None and j < len(vals)) else math.nan
+                    f_name, f_layer = split_feature_layer(fk)
+                    meta = feature_meta.get(fk, {})
+                    rows.append(
+                        (
+                            tag,
+                            i,
+                            j,
+                            tid,
+                            token_text,
+                            is_special,
+                            lp_val,
+                            ent_val,
+                            fk,
+                            f_name,
+                            f_layer,
+                            meta.get("mode", ""),
+                            float(meta.get("strength", math.nan)),
+                            meta.get("task", ""),
+                            pred,
+                        )
+                    )
+            else:
+                rows.append(
+                    (
+                        tag,
+                        i,
+                        j,
+                        tid,
+                        token_text,
+                        is_special,
+                        lp_val,
+                        ent_val,
+                        "",
+                        "",
+                        None,
+                        "",
+                        math.nan,
+                        "",
+                        math.nan,
+                    )
+                )
+
+            if len(rows) >= chunk_size:
+                flush_rows()
+
+    flush_rows()
+    if parquet_writer is not None:
+        parquet_writer.close()
+    return out_path
 
 
 def save_generations(
@@ -748,30 +798,6 @@ def save_generations(
             }
         )
     generations_path.write_text(json.dumps(payload, indent=2))
-
-
-def save_logprob_batches(
-    output_dir: Path,
-    stats: list[dict[str, object]],
-    tag: str,
-) -> None:
-    if not stats:
-        return
-    output_dir.mkdir(parents=True, exist_ok=True)
-    out_path = output_dir / f"logprob_stats_{tag}.csv"
-    with out_path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["prompt_index", "mean_logprob", "mean_prob", "mean_entropy", "tokens"])
-        for row in stats:
-            writer.writerow(
-                [
-                    row.get("prompt_index", ""),
-                    row.get("mean_logprob", ""),
-                    row.get("mean_prob", ""),
-                    row.get("mean_entropy", ""),
-                    row.get("tokens", ""),
-                ]
-            )
 
 
 def compute_gradient_cosines(
@@ -905,6 +931,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--generation-batch-size", type=int, default=4, help="Batch size for generation to manage memory.")
+    parser.add_argument("--token-stats-format", choices=["csv", "parquet"], default="parquet",
+                        help="Storage format for token-level statistics.")
+    parser.add_argument("--token-stats-include-text", action="store_true",
+                        help="Include decoded token text in token-level outputs (larger files).")
+    parser.add_argument("--token-stats-skip-special", action="store_true",
+                        help="Skip special tokens when exporting token-level stats.")
     return parser.parse_args()
 
 
@@ -932,7 +964,14 @@ def main() -> None:
 
     df = load_table(args.data_path, sheet=args.sheet)
     data_hash = sha256_file(args.data_path)
-    text_series, filtered_df = build_text_series(df, args)  # includes responses when available
+    text_series, filtered_df = build_text_series(
+        df,
+        text_column=args.text_column,
+        prompt_template=args.prompt_template,
+        template_fields=args.template_fields,
+        response_column=args.response_column,
+        prompt_response_sep="",
+    )  # includes responses when available
 
     feature_specs = parse_feature_specs(args.feature_specs)
     contexts_by_layer: dict[int, list[FeatureProbeContext]] = {}
@@ -964,7 +1003,7 @@ def main() -> None:
     # Use baseline answers from the sheet when available; otherwise, run baseline generation.
     baseline_logprobs = None
     # Pass 1: neutral interventions, no new tokens (old answers)
-    neutral_generations, _, neutral_logprobs, neutral_entropy, neutral_token_ids, neutral_cos, neutral_lp_batches, neutral_ent_batches, neutral_stats, neutral_token_preds = run_generation(
+    neutral_generations, _, neutral_logprobs, neutral_entropy, neutral_token_ids, neutral_cos, neutral_token_preds = run_generation(
         model,
         tokenizer,
         prompts=full_texts,
@@ -977,7 +1016,7 @@ def main() -> None:
     )
 
     # Pass 2: active interventions, no new tokens (old answers)
-    active_generations, _, active_logprobs, active_entropy, active_token_ids, active_cos, active_lp_batches, active_ent_batches, active_stats, active_token_preds = run_generation(
+    active_generations, _, active_logprobs, active_entropy, active_token_ids, active_cos, active_token_preds = run_generation(
         model,
         tokenizer,
         prompts=full_texts,
@@ -990,7 +1029,7 @@ def main() -> None:
     )
 
     # Pass 3: new generation without interventions
-    baseline_generations, _, baseline_logprobs, baseline_entropy, baseline_token_ids, baseline_cos, baseline_lp_batches, baseline_ent_batches, baseline_stats, baseline_token_preds = run_generation(
+    baseline_generations, _, baseline_logprobs, baseline_entropy, baseline_token_ids, baseline_cos, baseline_token_preds = run_generation(
         model,
         tokenizer,
         prompts=gen_prompts,
@@ -1003,7 +1042,7 @@ def main() -> None:
     )
 
     # Pass 4: new generation with interventions
-    generations, _, logprobs, entropy, token_ids, cos_records, intervened_lp_batches, intervened_ent_batches, intervened_stats, intervened_token_preds = run_generation(
+    generations, _, logprobs, entropy, token_ids, cos_records, intervened_token_preds = run_generation(
         model,
         tokenizer,
         prompts=gen_prompts,
@@ -1022,64 +1061,64 @@ def main() -> None:
             out_dir,
             tokenizer,
             prompts=full_texts,
-            intervened_token_ids=neutral_token_ids,
-            intervened_logprobs=neutral_logprobs,
-            intervened_entropy=neutral_entropy,
-            baseline_token_ids=None,
-            baseline_logprobs=None,
-            baseline_entropy=None,
+            token_ids=neutral_token_ids,
+            logprobs=neutral_logprobs,
+            entropy=neutral_entropy,
             contexts=layer_contexts,
             token_preds=neutral_token_preds,
             tag=f"token_stats_baseline_old{suffix}",
             column_suffix=suffix,
+            file_format=args.token_stats_format,
+            include_token_text=args.token_stats_include_text,
+            skip_special_tokens=args.token_stats_skip_special,
         )
 
         save_token_stats(
             out_dir,
             tokenizer,
             prompts=full_texts,
-            intervened_token_ids=active_token_ids,
-            intervened_logprobs=active_logprobs,
-            intervened_entropy=active_entropy,
-            baseline_token_ids=None,
-            baseline_logprobs=None,
-            baseline_entropy=None,
+            token_ids=active_token_ids,
+            logprobs=active_logprobs,
+            entropy=active_entropy,
             contexts=layer_contexts,
             token_preds=active_token_preds,
             tag=f"token_stats_intervention_old{suffix}",
             column_suffix=suffix,
+            file_format=args.token_stats_format,
+            include_token_text=args.token_stats_include_text,
+            skip_special_tokens=args.token_stats_skip_special,
         )
 
         save_token_stats(
             out_dir,
             tokenizer,
             prompts=gen_prompts,
-            intervened_token_ids=baseline_token_ids,
-            intervened_logprobs=baseline_logprobs,
-            intervened_entropy=baseline_entropy,
-            baseline_token_ids=None,
-            baseline_logprobs=None,
-            baseline_entropy=None,
+            token_ids=baseline_token_ids,
+            logprobs=baseline_logprobs,
+            entropy=baseline_entropy,
             contexts=layer_contexts,
             token_preds=baseline_token_preds,
             tag=f"token_stats_baseline_new{suffix}",
             column_suffix=suffix,
+            file_format=args.token_stats_format,
+            include_token_text=args.token_stats_include_text,
+            skip_special_tokens=args.token_stats_skip_special,
         )
 
         save_token_stats(
             out_dir,
             tokenizer,
             prompts=gen_prompts,
-            intervened_token_ids=token_ids,
-            intervened_logprobs=logprobs,
-            intervened_entropy=entropy,
-            baseline_token_ids=baseline_token_ids,
-            baseline_logprobs=baseline_logprobs,
-            baseline_entropy=baseline_entropy,
+            token_ids=token_ids,
+            logprobs=logprobs,
+            entropy=entropy,
             contexts=layer_contexts,
             token_preds=intervened_token_preds,
             tag=f"token_stats_intervention_new{suffix}",
             column_suffix=suffix,
+            file_format=args.token_stats_format,
+            include_token_text=args.token_stats_include_text,
+            skip_special_tokens=args.token_stats_skip_special,
         )
 
     save_generations(
@@ -1091,7 +1130,7 @@ def main() -> None:
         logprobs,
         tag="intervention_new",
     )
-    save_logprob_batches(out_dir, intervened_stats, tag="intervention_new")
+
     save_generations(
         out_dir,
         full_texts,
@@ -1101,7 +1140,7 @@ def main() -> None:
         neutral_logprobs,
         tag="baseline_old",
     )
-    save_logprob_batches(out_dir, neutral_stats, tag="baseline_old")
+
     save_generations(
         out_dir,
         full_texts,
@@ -1111,7 +1150,7 @@ def main() -> None:
         active_logprobs,
         tag="intervention_old",
     )
-    save_logprob_batches(out_dir, active_stats, tag="intervention_old")
+
     save_generations(
         out_dir,
         gen_prompts,
@@ -1121,16 +1160,11 @@ def main() -> None:
         baseline_logprobs,
         tag="baseline_new",
     )
-    save_logprob_batches(out_dir, baseline_stats, tag="baseline_new")
+
     all_cos = cos_records + neutral_cos + active_cos + baseline_cos
     save_gradient_cosines(out_dir, all_cos)
-    save_probe_analytics(out_dir, contexts_by_layer)
+
     save_metadata(out_dir, args, feature_specs, sorted(layers), data_hash=data_hash)
-    for prompt, generation in zip(gen_prompts, generations):
-        print("=" * 80)
-        print(prompt)
-        print("-" * 80)
-        print(generation)
 
 
 if __name__ == "__main__":

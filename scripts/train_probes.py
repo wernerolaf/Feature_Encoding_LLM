@@ -15,6 +15,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from activation_standardizer import ActivationStandardizer
 from probes import DecisionTreeProbe, LinearProbe, ShallowNNProbe
+from scripts.prompt_utils import PROMPT_TEMPLATE, build_text_series
 from utils import (
     build_probe_metadata,
     ensure_dir,
@@ -25,12 +26,6 @@ from utils import (
     set_seeds,
     sha256_file,
     sanitize_model_name,
-)
-
-PROMPT_TEMPLATE = (
-    "you want to convince your {gender} interlocutor with a {level} level of {trait}, "
-    'and answer "{belief}" to the question: "{question}". '
-    "Use {type} arguments to change {pronoun}'s mind.\n"
 )
 
 DTYPE_MAP = {
@@ -176,31 +171,15 @@ def detect_task(label_series: pd.Series, user_choice: str) -> str:
     return "classification"
 
 
-def build_text_series(df: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.Series, pd.DataFrame]:
-    if args.text_column and args.text_column in df.columns:
-        series = df[args.text_column]
-    else:
-        if not args.prompt_template:
-            raise ValueError("Provide --text-column or --prompt-template")
-
-        def render(row: pd.Series) -> str:
-            values = {field: row.get(field, "") for field in args.template_fields}
-            return args.prompt_template.format_map(values)
-
-        prompts = df.apply(render, axis=1)
-        if args.response_column and args.response_column in df.columns:
-            responses = df[args.response_column].fillna("").astype(str)
-            series = prompts + responses
-        else:
-            series = prompts
-
-    series = series.fillna("").astype(str).str.strip()
-    mask = series != ""
-    return series.loc[mask], df.loc[mask].copy()
-
-
 def prepare_dataset(df: pd.DataFrame, args: argparse.Namespace) -> tuple[list[str], np.ndarray]:
-    text_series, filtered_df = build_text_series(df, args)
+    text_series, filtered_df = build_text_series(
+        df,
+        text_column=args.text_column,
+        prompt_template=args.prompt_template,
+        template_fields=args.template_fields,
+        response_column=args.response_column,
+        prompt_response_sep="",
+    )
     if args.label_column not in filtered_df.columns:
         raise ValueError(f"Column '{args.label_column}' not found in the sheet.")
 
@@ -362,12 +341,34 @@ def main() -> None:
     label_encoder: LabelEncoder | None = None
     if task == "classification":
         label_encoder = LabelEncoder()
-        y = label_encoder.fit_transform(label_series.to_numpy())
+        y_rows = label_encoder.fit_transform(label_series.to_numpy())
     else:
-        y = label_series.to_numpy(dtype=np.float32)
+        y_rows = label_series.to_numpy(dtype=np.float32)
 
-    activations, token_counts = collect_layer_activations(
-        texts=texts,
+    texts_arr = np.asarray(texts, dtype=object)
+    row_indices = np.arange(texts_arr.shape[0])
+    stratify_rows = y_rows if task == "classification" else None
+    train_rows, test_rows = train_test_split(
+        row_indices,
+        test_size=args.test_size,
+        stratify=stratify_rows,
+        random_state=args.random_state,
+    )
+
+    train_texts = texts_arr[train_rows].tolist()
+    test_texts = texts_arr[test_rows].tolist()
+
+    X_train, train_token_counts = collect_layer_activations(
+        texts=train_texts,
+        model=model,
+        tokenizer=tokenizer,
+        layer=args.layer,
+        batch_size=args.batch_size,
+        device=device,
+        max_length=args.max_length,
+    )
+    X_test, test_token_counts = collect_layer_activations(
+        texts=test_texts,
         model=model,
         tokenizer=tokenizer,
         layer=args.layer,
@@ -376,15 +377,9 @@ def main() -> None:
         max_length=args.max_length,
     )
 
-    y = np.repeat(y, token_counts)
+    y_train = np.repeat(y_rows[train_rows], train_token_counts)
+    y_test = np.repeat(y_rows[test_rows], test_token_counts)
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        activations,
-        y,
-        test_size=args.test_size,
-        stratify=y,
-        random_state=args.random_state,
-    )
 
     standardizer = make_standardizer(args, device=device)
     probe = make_probe(args, standardizer=standardizer, device=device, task=task)
@@ -401,9 +396,26 @@ def main() -> None:
         print(f"Test accuracy:  {test_acc:.4f}")
         metrics.update({"train_accuracy": float(train_acc), "test_accuracy": float(test_acc)})
         if label_encoder is not None:
-            class_report = classification_report(y_test, test_pred, target_names=label_encoder.classes_, output_dict=True)
+            class_labels = np.arange(len(label_encoder.classes_))
+            class_report = classification_report(
+                y_test,
+                test_pred,
+                labels=class_labels,
+                target_names=label_encoder.classes_,
+                output_dict=True,
+                zero_division=0,
+            )
             metrics["classification_report"] = class_report
-            print(classification_report(y_test, test_pred, target_names=label_encoder.classes_))
+            print(
+                classification_report(
+                    y_test,
+                    test_pred,
+                    labels=class_labels,
+                    target_names=label_encoder.classes_,
+                    zero_division=0,
+                )
+            )
+
     else:
         train_mse = mean_squared_error(y_train, train_pred)
         test_mse = mean_squared_error(y_test, test_pred)

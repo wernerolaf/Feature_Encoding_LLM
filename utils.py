@@ -17,6 +17,13 @@ import torch
 def sanitize_model_name(name: str) -> str:
     return name.replace("/", "_")
 
+def resolve_artifact_label(args: argparse.Namespace) -> str:
+    if args.artifact_label is not None:
+        label = str(args.artifact_label).strip()
+        if not label:
+            raise ValueError("--artifact-label cannot be empty.")
+        return label
+    return f"latent{args.latent_dim}"
 
 def set_seeds(seed: int) -> None:
     torch.manual_seed(seed)
@@ -42,7 +49,9 @@ def load_table(path: str | Path, sheet: str | None = None) -> pd.DataFrame:
         sep = "\t" if suffix == ".tsv" else ","
         return pd.read_csv(file_path, sep=sep)
     if suffix in {".xlsx", ".xls"}:
-        return pd.read_excel(file_path, sheet_name=sheet)
+        # If sheet is None, default to the first sheet to ensure a DataFrame is returned.
+        sheet_name = 0 if sheet is None else sheet
+        return pd.read_excel(file_path, sheet_name=sheet_name)
     raise ValueError(f"Unsupported data format '{suffix}'. Use csv/tsv/xlsx.")
 
 

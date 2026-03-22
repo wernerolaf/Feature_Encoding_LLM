@@ -8,6 +8,7 @@ import argparse
 import json
 import re
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Dict, Iterable, Tuple
 
@@ -19,6 +20,7 @@ def _tokenize(text: str) -> Iterable[str]:
     return re.findall(r"[A-Za-z']+", text.lower())
 
 
+@lru_cache(maxsize=None)
 def load_dictionary(dictionary_path: Path) -> Tuple[Callable[[str], Iterable[str]], Tuple[str, ...]]:
     """Load a LIWC dictionary and return the parser function and category names."""
     parse, category_names = liwc.load_token_parser(str(dictionary_path))

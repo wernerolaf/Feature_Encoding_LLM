@@ -118,6 +118,7 @@ class ActivationStandardizer:
         raise ValueError(f"Unknown strategy '{self.strategy}'")
 
     def direction_to_input_space(self, direction: np.ndarray) -> np.ndarray:
+        # gradients do not need bias
         direction = np.asarray(direction)
         original_was_1d = direction.ndim == 1
         if original_was_1d:
@@ -152,7 +153,7 @@ class ActivationStandardizer:
                 raise RuntimeError("Autoencoder not fitted.")
             tensor = torch.from_numpy(direction).float().to(self.device)
             with torch.no_grad():
-                mapped = self._autoencoder.decode(tensor)
+                mapped = tensor @ self._autoencoder.decoder.weight.T
             mapped_np = mapped.cpu().numpy()
             return mapped_np[0] if original_was_1d else mapped_np
 

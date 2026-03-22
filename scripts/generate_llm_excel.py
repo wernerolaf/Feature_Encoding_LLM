@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional
 
 import pandas as pd
 
-from liwc_analysis import liwc_statistics_from_text, _tokenize
+from scripts.liwc_analysis import liwc_statistics_from_text, _tokenize
 
 # Column order matching data/LLM_nano.xlsx
 COLUMNS: List[str] = [
