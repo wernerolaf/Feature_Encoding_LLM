@@ -179,6 +179,7 @@ def build_autoencoder_metadata(
     loss_history_path: Path | None,
     data_hash: str | None,
     sample_count: int,
+    metrics: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "artifact_type": "autoencoder",
@@ -188,12 +189,16 @@ def build_autoencoder_metadata(
         "latent_dim": latent_dim,
         "beta": args.beta,
         "epochs": args.epochs,
+        "training_steps": args.training_steps,
         "lr": args.lr,
         "weight_decay": args.weight_decay,
         "ae_batch_size": args.ae_batch_size,
         "batch_size": args.batch_size,
         "dtype": args.dtype,
         "seed": args.seed,
+        "input_norm": args.input_norm,
+        "norm_eps": args.norm_eps,
+        "l0_threshold": args.l0_threshold,
         "data_path": str(args.data_path),
         "data_hash": data_hash,
         "sheet": args.sheet,
@@ -206,6 +211,7 @@ def build_autoencoder_metadata(
         "loss_history_path": str(loss_history_path) if loss_history_path else None,
         "git_sha": git_sha(),
         "sample_count": sample_count,
+        "metrics": metrics or {},
     }
 
 

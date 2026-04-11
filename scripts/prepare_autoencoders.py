@@ -46,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--model-name", required=True, help="Hugging Face model id.")
     parser.add_argument("--data-path", required=True, help="Path to the data file (csv/tsv/xlsx).")
-    parser.add_argument("--sheet", required=True, help="Worksheet name to read.")
+    parser.add_argument("--sheet", default=None, help="Optional worksheet name (xlsx only).")
     parser.add_argument("--text-column", default=None, help="Use this column directly if present.")
     parser.add_argument(
         "--prompt-template",
@@ -82,6 +82,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--latent-dim", type=int, default=256, help="Autoencoder hidden width.")
     parser.add_argument("--ae-batch-size", type=int, default=128, help="Autoencoder batch size.")
     parser.add_argument("--epochs", type=int, default=30, help="Autoencoder training epochs.")
+    parser.add_argument(
+        "--training-steps",
+        type=int,
+        default=None,
+        help="Optional number of autoencoder training steps (overrides epochs).",
+    )
     parser.add_argument("--lr", type=float, default=1e-3, help="Autoencoder learning rate.")
     parser.add_argument("--beta", type=float, default=1e-3, help="L1 sparsity coefficient.")
     parser.add_argument("--weight-decay", type=float, default=1e-5, help="Optimizer weight decay.")
@@ -101,6 +107,29 @@ def parse_args() -> argparse.Namespace:
         "--log-dir",
         default=None,
         help="Directory to store TensorBoard event files for autoencoder training (optional).",
+    )
+    parser.add_argument(
+        "--input-norm",
+        choices=["none", "layernorm", "rmsnorm"],
+        default="layernorm",
+        help="Normalize activations before the autoencoder (per-token).",
+    )
+    parser.add_argument("--norm-eps", type=float, default=1e-5, help="Epsilon for input normalization.")
+    parser.add_argument(
+        "--l0-threshold",
+        type=float,
+        default=1e-6,
+        help="Threshold for counting non-zero latents (L0) and dead units.",
+    )
+    parser.add_argument(
+        "--tqdm",
+        action="store_true",
+        help="Enable tqdm progress bars during autoencoder training.",
+    )
+    parser.add_argument(
+        "--no-tqdm",
+        action="store_true",
+        help="Disable tqdm progress bars during autoencoder training.",
     )
     parser.add_argument(
         "--no-history",
@@ -140,6 +169,7 @@ def config_to_dict(cfg: AutoEncoderConfig) -> dict:
         "lr": cfg.lr,
         "batch_size": cfg.batch_size,
         "epochs": cfg.epochs,
+        "training_steps": cfg.training_steps,
         "beta": cfg.beta,
         "weight_decay": cfg.weight_decay,
         "activation": cfg.activation.__class__.__name__,
@@ -147,6 +177,10 @@ def config_to_dict(cfg: AutoEncoderConfig) -> dict:
         "log_dir": cfg.log_dir,
         "log_interval": cfg.log_interval,
         "track_history": cfg.track_history,
+        "input_norm": cfg.input_norm,
+        "norm_eps": cfg.norm_eps,
+        "l0_threshold": cfg.l0_threshold,
+        "tqdm": cfg.tqdm,
     }
 
 
@@ -219,7 +253,7 @@ def collect_layer_activations(
             layer_states = hidden_states[idx]                # [batch, seq, hidden]
             valid_tokens = attention_mask.bool()
             token_activations = layer_states[valid_tokens]   # [batch*seq_valid, hidden]
-            buckets[layer].append(token_activations.cpu())
+            buckets[layer].append(token_activations.float().cpu())
 
     return {layer: torch.cat(chunks, dim=0).numpy() for layer, chunks in buckets.items()}
 
@@ -230,7 +264,7 @@ def train_and_save_autoencoder(
     version_dir: Path,
     args: argparse.Namespace,
     device: torch.device,
-) -> tuple[Path, Optional[Path]]:
+) -> tuple[Path, Optional[Path], dict[str, float]]:
     tb_dir = version_dir / "tensorboard" if args.log_dir is not None else None
 
     track_history = not args.no_history or args.loss_history_dir is not None
@@ -240,6 +274,7 @@ def train_and_save_autoencoder(
         lr=args.lr,
         batch_size=args.ae_batch_size,
         epochs=args.epochs,
+        training_steps=args.training_steps,
         beta=args.beta,
         weight_decay=args.weight_decay,
         activation=ACTIVATION_FACTORIES[args.activation.lower()](),
@@ -247,6 +282,10 @@ def train_and_save_autoencoder(
         log_dir=str(tb_dir) if tb_dir is not None else None,
         log_interval=max(1, args.log_interval),
         track_history=track_history,
+        input_norm=args.input_norm,
+        norm_eps=args.norm_eps,
+        l0_threshold=args.l0_threshold,
+        tqdm=(False if args.no_tqdm else True),
     )
     standardizer = ActivationStandardizer(
         strategy="autoencoder",
@@ -255,6 +294,7 @@ def train_and_save_autoencoder(
     )
     standardizer.fit(activations)
     history = standardizer.get_autoencoder_history()
+    metrics = standardizer.get_autoencoder_metrics()
 
     artifact = {
         "model_name": args.model_name,
@@ -263,6 +303,7 @@ def train_and_save_autoencoder(
         "input_dim": standardizer._input_dim,
         "latent_dim": standardizer._latent_dim,
         "config": config_to_dict(cfg),
+        "metrics": metrics,
         "state_dict": standardizer._autoencoder.state_dict(),
     }
 
@@ -284,7 +325,7 @@ def train_and_save_autoencoder(
         pd.DataFrame(history).to_csv(history_path, index=False)
         print(f"Saved loss history to {history_path}")
 
-    return weights_path, history_path
+    return weights_path, history_path, metrics
 
 
 def main() -> None:
@@ -318,6 +359,10 @@ def main() -> None:
     artifact_label = resolve_artifact_label(args)
 
     for layer, activations in activations_by_layer.items():
+        if args.latent_dim > 4 * activations.shape[1]:
+            raise ValueError(
+                f"latent_dim {args.latent_dim} exceeds 4x input_dim {activations.shape[1]}."
+            )
         version_dir = next_version_dir(
             kind="autoencoders",
             model_name=args.model_name,
@@ -326,7 +371,7 @@ def main() -> None:
             base_dir=args.output_dir,
             version_override=args.version,
         )
-        weights_path, history_path = train_and_save_autoencoder(
+        weights_path, history_path, metrics = train_and_save_autoencoder(
             activations, layer, version_dir, args, device
         )
         metadata = build_autoencoder_metadata(
@@ -338,6 +383,7 @@ def main() -> None:
             loss_history_path=history_path,
             data_hash=data_hash,
             sample_count=activations.shape[0],
+            metrics=metrics,
         )
         save_json(metadata, version_dir / "metadata.json")
         print(

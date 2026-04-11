@@ -5,14 +5,13 @@
 #SBATCH --partition=short
 #SBATCH --time=23:59:00
 #SBATCH --gres=gpu:a100:1
-#SBATCH --job-name=train_probes
+#SBATCH --job-name=train_nn_probes
 #SBATCH --array=0-48
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 SUBMIT_DIR="${SLURM_SUBMIT_DIR:-$SCRIPT_DIR}"
-# Assume sbatch was launched from Feature_Encoding_LLM.
 FE_ROOT="${SUBMIT_DIR:-$SCRIPT_DIR}"
 
 # Use shared scratch (via slurm_env.sh) for caches and EVAFS for outputs if configured.
@@ -24,10 +23,9 @@ elif [ -f "${SCRIPT_DIR}/slurm_env.sh" ]; then
 fi
 
 if [ -n "${ENV_FILE}" ]; then
-  # shellcheck disable=SC1090
   source "${ENV_FILE}"
 else
-  echo "[train_probes] slurm_env.sh not found; continuing without extra cache setup." >&2
+  echo "[train_nn_probes] slurm_env.sh not found; continuing without extra cache setup." >&2
 fi
 
 if [[ -n "${HUGGING_FACE_HUB_TOKEN:-}" || -n "${HF_TOKEN:-}" ]]; then
@@ -51,14 +49,18 @@ PROBE_ROOT="${PROBE_ROOT:-artifacts/probes}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
 DTYPE="${DTYPE:-bfloat16}"
-LOGISTIC_PENALTY="${LOGISTIC_PENALTY:-l2}"
-LOGISTIC_C="${LOGISTIC_C_OVERRIDE:-1.0}"
-LOGISTIC_MAX_ITER="${LOGISTIC_MAX_ITER:-100}"
 VAL_SIZE="${VAL_SIZE:-0.1}"
 TEST_SIZE="${TEST_SIZE:-0.2}"
 RANDOM_STATE="${RANDOM_STATE:-0}"
 LABEL_CHUNK_SIZE="${LABEL_CHUNK_SIZE:-0}"
 LAYER_CHUNK_SIZE="${LAYER_CHUNK_SIZE:-8}"
+
+NN_HIDDEN_DIM="${NN_HIDDEN_DIM:-128}"
+NN_DROPOUT="${NN_DROPOUT:-0.0}"
+NN_EPOCHS="${NN_EPOCHS:-10}"
+NN_BATCH_SIZE="${NN_BATCH_SIZE:-128}"
+NN_LR="${NN_LR:-1e-3}"
+NN_WEIGHT_DECAY="${NN_WEIGHT_DECAY:-0.0}"
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:-}"
 VERSION="${VERSION_OVERRIDE:-${TASK_ID:-}}"
@@ -92,10 +94,11 @@ fi
 AE_COUNT=${#AE_LIST_FIRST[@]}
 
 TOTAL_JOBS=$(( AE_COUNT * LAYER_CHUNK_COUNT * LABEL_CHUNK_COUNT ))
-echo "[train_probes] total_jobs=${TOTAL_JOBS} (AE=${AE_COUNT}, layer_chunks=${LAYER_CHUNK_COUNT}, label_chunks=${LABEL_CHUNK_COUNT})"
+echo "[train_nn_probes] total_jobs=${TOTAL_JOBS} (AE=${AE_COUNT}, layer_chunks=${LAYER_CHUNK_COUNT}, label_chunks=${LABEL_CHUNK_COUNT})"
+
 if [ -n "${TASK_ID}" ]; then
   if [ "${TASK_ID}" -ge "${TOTAL_JOBS}" ]; then
-    echo "[train_probes] SLURM_ARRAY_TASK_ID=${TASK_ID} exceeds variants=${TOTAL_JOBS} (AE=${AE_COUNT}, layer_chunks=${LAYER_CHUNK_COUNT}, label_chunks=${LABEL_CHUNK_COUNT})" >&2
+    echo "[train_nn_probes] SLURM_ARRAY_TASK_ID=${TASK_ID} exceeds variants=${TOTAL_JOBS}" >&2
     exit 1
   fi
   AE_IDX=$((TASK_ID / (LAYER_CHUNK_COUNT * LABEL_CHUNK_COUNT)))
@@ -146,10 +149,13 @@ if [ "${AE_SELECTED}" = "baseline" ]; then
     --max-length "$MAX_LENGTH" \
     --dtype "$DTYPE" \
     --standardizer identity \
-    --probe-type linear \
-    --logistic-penalty "$LOGISTIC_PENALTY" \
-    --logistic-C "$LOGISTIC_C" \
-    --logistic-max-iter "$LOGISTIC_MAX_ITER" \
+    --probe-type shallow_nn \
+    --nn-hidden-dim "$NN_HIDDEN_DIM" \
+    --nn-dropout "$NN_DROPOUT" \
+    --nn-epochs "$NN_EPOCHS" \
+    --nn-batch-size "$NN_BATCH_SIZE" \
+    --nn-lr "$NN_LR" \
+    --nn-weight-decay "$NN_WEIGHT_DECAY" \
     --tqdm \
     --val-size "$VAL_SIZE" \
     --test-size "$TEST_SIZE" \
@@ -170,10 +176,13 @@ else
     --autoencoder-root "$AE_ROOT" \
     --autoencoder-label-filter "$AE_LABEL" \
     --autoencoder-version "latest" \
-    --probe-type linear \
-    --logistic-penalty "$LOGISTIC_PENALTY" \
-    --logistic-C "$LOGISTIC_C" \
-    --logistic-max-iter "$LOGISTIC_MAX_ITER" \
+    --probe-type shallow_nn \
+    --nn-hidden-dim "$NN_HIDDEN_DIM" \
+    --nn-dropout "$NN_DROPOUT" \
+    --nn-epochs "$NN_EPOCHS" \
+    --nn-batch-size "$NN_BATCH_SIZE" \
+    --nn-lr "$NN_LR" \
+    --nn-weight-decay "$NN_WEIGHT_DECAY" \
     --tqdm \
     --val-size "$VAL_SIZE" \
     --test-size "$TEST_SIZE" \
@@ -184,4 +193,4 @@ fi
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
-echo "[train_probes] total_runtime_seconds=${ELAPSED}"
+echo "[train_nn_probes] total_runtime_seconds=${ELAPSED}"

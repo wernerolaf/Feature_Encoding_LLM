@@ -6,6 +6,7 @@ from typing import Literal, Mapping, Optional, Union
 
 import numpy as np
 import torch
+from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -41,6 +42,10 @@ class ActivationStandardizer:
         self._input_dim: Optional[int] = None
         self._latent_dim: Optional[int] = None
         self._autoencoder_history: list[dict[str, float]] = []
+        self._autoencoder_metrics: dict[str, float] = {}
+        self._input_norm: str = "none"
+        self._norm_eps: float = 1e-5
+        self._l0_threshold: float = 1e-6
 
     def fit(self, X: np.ndarray) -> "ActivationStandardizer":
         X = self._require_2d(X)
@@ -62,6 +67,9 @@ class ActivationStandardizer:
                     )
                 return self
             cfg = self.autoencoder_config
+            self._input_norm = cfg.input_norm
+            self._norm_eps = cfg.norm_eps
+            self._l0_threshold = cfg.l0_threshold
             self._latent_dim = cfg.hidden_dim
             self._autoencoder = SparseAutoencoder(
                 input_dim=self._input_dim,
@@ -89,6 +97,7 @@ class ActivationStandardizer:
             if self._autoencoder is None:
                 raise RuntimeError("Autoencoder not fitted.")
             tensor = torch.from_numpy(X).float().to(self.device)
+            tensor = self._apply_input_norm_tensor(tensor, self._input_norm, self._norm_eps)
             with torch.no_grad():
                 latent = self._autoencoder.encode(tensor)
             return latent.cpu().numpy()
@@ -174,6 +183,9 @@ class ActivationStandardizer:
         activation_module = activation or cfg.activation
 
         self._input_dim = input_dim
+        self._input_norm = cfg.input_norm
+        self._norm_eps = cfg.norm_eps
+        self._l0_threshold = cfg.l0_threshold
         self._latent_dim = hidden
         self._autoencoder = SparseAutoencoder(
             input_dim=input_dim,
@@ -184,6 +196,7 @@ class ActivationStandardizer:
         self._autoencoder.load_state_dict(dict(state_dict))
         self._autoencoder.eval()
         self._autoencoder_history = []
+        self._autoencoder_metrics = {}
 
     def load_autoencoder_artifact(
         self,
@@ -222,6 +235,9 @@ class ActivationStandardizer:
             beta=self.autoencoder_config.beta,
             activation=self.autoencoder_config.activation,
         )
+        metrics_obj = loaded.get("metrics")
+        if isinstance(metrics_obj, Mapping):
+            self._autoencoder_metrics = {str(k): float(v) for k, v in metrics_obj.items() if v is not None}
 
     # ------------------------------------------------------------------ #
     def _train_autoencoder(self, X: np.ndarray, cfg: "AutoEncoderConfig") -> None:
@@ -251,52 +267,143 @@ class ActivationStandardizer:
         history_records: list[dict[str, float]] | None = [] if track_history else None
         global_step = 0
         total_samples = len(dataset)
+        total_seen = 0
+        total_elements = 0
+        mse_sum = 0.0
+        l1_sum = 0.0
+        l0_sum = 0.0
+        latent_sum = 0.0
+        latent_sumsq = 0.0
+        latent_zero_count = 0.0
+        active_mask: torch.Tensor | None = None
 
         self._autoencoder.train()
-        for epoch in range(cfg.epochs):
-            epoch_loss = 0.0
-            for batch_index, (batch,) in enumerate(loader):
+        epoch_iter = tqdm(range(cfg.epochs), desc="SAE epochs", disable=not cfg.tqdm)
+        for epoch in epoch_iter:
+            batch_iter = tqdm(
+                loader,
+                desc=f"Epoch {epoch+1}/{cfg.epochs}",
+                leave=False,
+                disable=not cfg.tqdm,
+            )
+            for batch_index, (batch,) in enumerate(batch_iter):
                 batch = batch.to(self.device)
+                batch = self._apply_input_norm_tensor(batch, cfg.input_norm, cfg.norm_eps)
                 optimizer.zero_grad()
                 recon, latent = self._autoencoder(batch)
                 mse = loss_fn(recon, batch)
-                sparsity = cfg.beta * latent.abs().mean()
-                loss = mse + sparsity
+                l1_mean = latent.abs().mean()
+                loss = mse + cfg.beta * l1_mean
                 loss.backward()
                 optimizer.step()
 
+                batch_size = batch.size(0)
                 loss_value = float(loss.item())
-                epoch_loss += loss_value * batch.size(0)
+                mse_value = float(mse.item())
+                l1_value = float(l1_mean.item())
+                l0_counts = (latent.abs() > cfg.l0_threshold).sum(dim=1).float()
+                l0_mean = float(l0_counts.mean().item())
+                sparsity = float((latent.abs() <= cfg.l0_threshold).float().mean().item())
+
+                mse_sum += mse_value * batch_size
+                l1_sum += l1_value * batch_size
+                l0_sum += l0_mean * batch_size
+                latent_sum += float(latent.sum().item())
+                latent_sumsq += float((latent ** 2).sum().item())
+                latent_zero_count += float((latent.abs() <= cfg.l0_threshold).sum().item())
+                total_elements += latent.numel()
+                total_seen += batch_size
+
+                if active_mask is None:
+                    active_mask = (latent.abs() > cfg.l0_threshold).any(dim=0)
+                else:
+                    active_mask |= (latent.abs() > cfg.l0_threshold).any(dim=0)
 
                 if history_records is not None:
                     history_records.append(
-                        {"epoch": epoch, "batch": batch_index, "loss": loss_value}
+                        {
+                            "epoch": epoch,
+                            "batch": batch_index,
+                            "loss": loss_value,
+                            "mse": mse_value,
+                            "l1": l1_value,
+                            "avg_l0": l0_mean,
+                            "sparsity": sparsity,
+                        }
                     )
                 if writer and global_step % log_interval == 0:
                     writer.add_scalar("autoencoder/batch_loss", loss_value, global_step)
+                    writer.add_scalar("autoencoder/batch_mse", mse_value, global_step)
+                    writer.add_scalar("autoencoder/batch_l1", l1_value, global_step)
+                    writer.add_scalar("autoencoder/batch_avg_l0", l0_mean, global_step)
+                    writer.add_scalar("autoencoder/batch_sparsity", sparsity, global_step)
                 global_step += 1
 
-            avg_loss = epoch_loss / total_samples if total_samples else float("nan")
-            if history_records is not None:
-                history_records.append(
-                    {"epoch": epoch, "batch": -1, "loss": float(avg_loss)}
-                )
-            if writer:
-                writer.add_scalar("autoencoder/epoch_loss", avg_loss, epoch)
             if cfg.verbose:
-                print(
-                    f"[Autoencoder] epoch={epoch+1}/{cfg.epochs} loss={avg_loss:.6f}"
-                )
+                avg_loss = (mse_sum + cfg.beta * l1_sum) / max(1, total_seen)
+                print(f"[Autoencoder] epoch={epoch+1}/{cfg.epochs} loss={avg_loss:.6f}")
 
         if writer:
             writer.flush()
             writer.close()
 
+        total_samples_safe = max(1, total_seen)
+        avg_mse = mse_sum / total_samples_safe
+        avg_l1 = l1_sum / total_samples_safe
+        avg_l0 = l0_sum / total_samples_safe
+        latent_mean = latent_sum / max(1, total_elements)
+        latent_var = (latent_sumsq / max(1, total_elements)) - latent_mean ** 2
+        latent_std = float(np.sqrt(max(latent_var, 0.0)))
+        latent_sparsity = latent_zero_count / max(1.0, total_elements)
+        dead_fraction = 0.0
+        if active_mask is not None:
+            dead_fraction = float(1.0 - active_mask.float().mean().item())
+
         self._autoencoder.eval()
         self._autoencoder_history = history_records or []
+        self._autoencoder_metrics = {
+            "reconstruction_mse": float(avg_mse),
+            "avg_l1": float(avg_l1),
+            "avg_l0": float(avg_l0),
+            "dead_latent_fraction": float(dead_fraction),
+            "latent_mean": float(latent_mean),
+            "latent_std": float(latent_std),
+            "latent_sparsity": float(latent_sparsity),
+            "total_steps": float(global_step),
+            "steps_per_epoch": float(len(loader)),
+        }
 
     def get_autoencoder_history(self) -> list[dict[str, float]]:
         return list(self._autoencoder_history)
+
+    def get_autoencoder_metrics(self) -> dict[str, float]:
+        return dict(self._autoencoder_metrics)
+
+    @staticmethod
+    def _apply_input_norm_array(x: np.ndarray, mode: str, eps: float) -> np.ndarray:
+        if mode == "none":
+            return x
+        if mode == "layernorm":
+            mean = x.mean(axis=1, keepdims=True)
+            var = x.var(axis=1, keepdims=True)
+            return (x - mean) / np.sqrt(var + eps)
+        if mode == "rmsnorm":
+            rms = np.sqrt((x ** 2).mean(axis=1, keepdims=True) + eps)
+            return x / rms
+        raise ValueError(f"Unknown input norm '{mode}'")
+
+    @staticmethod
+    def _apply_input_norm_tensor(x: torch.Tensor, mode: str, eps: float) -> torch.Tensor:
+        if mode == "none":
+            return x
+        if mode == "layernorm":
+            mean = x.mean(dim=1, keepdim=True)
+            var = x.var(dim=1, keepdim=True, unbiased=False)
+            return (x - mean) / torch.sqrt(var + eps)
+        if mode == "rmsnorm":
+            rms = torch.sqrt((x ** 2).mean(dim=1, keepdim=True) + eps)
+            return x / rms
+        raise ValueError(f"Unknown input norm '{mode}'")
 
     @staticmethod
     def _require_2d(X: np.ndarray) -> np.ndarray:
@@ -314,6 +421,7 @@ class AutoEncoderConfig:
     lr: float = 1e-3
     batch_size: int = 128
     epochs: int = 30
+    training_steps: int | None = None
     beta: float = 1e-3
     weight_decay: float = 1e-5
     activation: nn.Module = nn.ReLU()
@@ -321,6 +429,10 @@ class AutoEncoderConfig:
     log_dir: Optional[str] = None
     log_interval: int = 10
     track_history: bool = True
+    input_norm: str = "none"
+    norm_eps: float = 1e-5
+    l0_threshold: float = 1e-6
+    tqdm: bool = True
 
     @classmethod
     def from_dict(cls, data: Mapping[str, object]) -> "AutoEncoderConfig":
@@ -344,6 +456,9 @@ class AutoEncoderConfig:
             lr=float(data.get("lr", defaults.lr)),
             batch_size=int(data.get("batch_size", defaults.batch_size)),
             epochs=int(data.get("epochs", defaults.epochs)),
+            training_steps=(
+                int(data["training_steps"]) if data.get("training_steps") is not None else None
+            ),
             beta=float(data.get("beta", defaults.beta)),
             weight_decay=float(data.get("weight_decay", defaults.weight_decay)),
             activation=activation,
@@ -357,6 +472,10 @@ class AutoEncoderConfig:
             track_history=cls._coerce_bool(
                 data.get("track_history", defaults.track_history)
             ),
+            input_norm=str(data.get("input_norm", defaults.input_norm)),
+            norm_eps=float(data.get("norm_eps", defaults.norm_eps)),
+            l0_threshold=float(data.get("l0_threshold", defaults.l0_threshold)),
+            tqdm=cls._coerce_bool(data.get("tqdm", defaults.tqdm)),
         )
 
     @staticmethod

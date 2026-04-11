@@ -1,5 +1,5 @@
 """
-Generate an Excel file in the same column structure as data/LLM_nano.xlsx
+Generate a CSV file in the same column structure as data/LLM_nano.csv
 from a JSON file of prompts and model generations.
 
 Inputs expect a list of dicts shaped like artifacts/experiments/gender_clout/generations_*.json:
@@ -15,7 +15,7 @@ Inputs expect a list of dicts shaped like artifacts/experiments/gender_clout/gen
 ]
 
 Dependencies (install if missing):
-  pip install pandas openpyxl liwc
+  pip install pandas liwc
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ import pandas as pd
 
 from scripts.liwc_analysis import liwc_statistics_from_text, _tokenize
 
-# Column order matching data/LLM_nano.xlsx
+# Column order matching data/LLM_nano.csv
 COLUMNS: List[str] = [
     "id",
     "level",
@@ -247,21 +247,11 @@ def load_metadata(path: Optional[Path]) -> Dict[str, Any]:
         return {}
 
 
-def sanitize_sheet_name(name: str) -> str:
-    """
-    Excel sheet names must be <=31 chars and cannot contain: : \\ / ? * [ ]
-    """
-    invalid = set(':\\/?!*[]')
-    cleaned = "".join(ch for ch in name if ch not in invalid)
-    cleaned = cleaned.strip()
-    return cleaned[:31] if cleaned else "sheet"
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate an Excel file matching LLM_nano.xlsx structure.")
+    parser = argparse.ArgumentParser(description="Generate a CSV file matching LLM_nano.csv structure.")
     parser.add_argument("--input", required=True, type=Path, help="Path to generations JSON.")
-    parser.add_argument("--output", required=True, type=Path, help="Output Excel path (e.g., output.xlsx).")
-    parser.add_argument("--model", required=False, help="Model name to store in rows and sheet name (fallback to metadata).")
+    parser.add_argument("--output", required=True, type=Path, help="Output CSV path (e.g., output.csv).")
+    parser.add_argument("--model", required=False, help="Model name to store in rows (fallback to metadata).")
     parser.add_argument("--metadata", type=Path, default=None, help="Optional path to metadata.json (defaults to alongside input).")
     parser.add_argument(
         "--dict",
@@ -306,10 +296,8 @@ def main() -> None:
 
     df = pd.DataFrame(rows, columns=COLUMNS)
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    sheet_name = sanitize_sheet_name(model_name)
-    with pd.ExcelWriter(args.output) as writer:
-        df.to_excel(writer, sheet_name=sheet_name, index=False)
-    print(f"Wrote {len(df)} rows to {args.output} (sheet={sheet_name})")
+    df.to_csv(args.output, index=False)
+    print(f"Wrote {len(df)} rows to {args.output}")
 
     if args.metadata_out:
         meta_payload = {

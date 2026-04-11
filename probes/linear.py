@@ -25,10 +25,8 @@ class LinearProbe(BaseProbe):
 
         if self.task == "classification":
             cfg = dict(
-                penalty="l1",
+                penalty="l2",
                 C=1.0,
-                solver="saga",
-                max_iter=2000,
                 random_state=0,
             )
             if logistic_kwargs:

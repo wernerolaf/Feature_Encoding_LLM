@@ -901,7 +901,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Feature interaction experiment with probe interventions.")
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--data-path", required=True)
-    parser.add_argument("--sheet", required=True)
+    parser.add_argument("--sheet", default=None, help="Optional worksheet name (xlsx only).")
     parser.add_argument("--layer", type=int, default=None, help="Optional default layer applied to any feature without an explicit layer.")
     parser.add_argument("--probe-dir", default="artifacts/probes", help="Directory containing pre-trained probe artifacts.")
     parser.add_argument("--text-column", default=None)
