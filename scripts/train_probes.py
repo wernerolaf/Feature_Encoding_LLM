@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 import torch
 import time
+import gc
 from tqdm import tqdm
 from sklearn.metrics import (
     accuracy_score,
@@ -894,6 +895,13 @@ def main() -> None:
                     log(f"Saved probe artifact to {artifact_path}")
                 finally:
                     probe.standardizer = standardizer_ref
+
+            # Free probe-related memory between labels.
+            del probe
+            del standardizer
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

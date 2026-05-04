@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Literal, Optional, Sequence
@@ -13,6 +15,11 @@ import numpy as np
 import pandas as pd
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover - fallback for minimal environments
+    def tqdm(iterable=None, *args, **kwargs):
+        return iterable if iterable is not None else []
 
 from activation_standardizer import ActivationStandardizer
 from probes import DecisionTreeProbe, LinearProbe, ShallowNNProbe
@@ -29,6 +36,39 @@ from utils import (
 )
 
 InterventionMode = Literal["increase", "decrease", "project"]
+StrengthUnit = Literal["raw", "activation_pct"]
+
+
+def tensor_to_numpy_float(tensor: torch.Tensor) -> np.ndarray:
+    """Convert model activations/logits to NumPy in a dtype NumPy supports."""
+    return tensor.detach().float().cpu().numpy()
+
+
+def canonical_model_key(model_name: str) -> str:
+    key = str(model_name).strip().split("/")[-1].lower().replace("_", "-")
+    key = re.sub(r"-instruct.*$", "", key)
+    key = re.sub(r"-deduped$", "", key)
+    return key
+
+
+def filter_rows_for_model(df: pd.DataFrame, *, model_name: str, column: str, filter_value: str | None = None) -> pd.DataFrame:
+    if column not in df.columns:
+        print(f"[data] model filter skipped: column '{column}' not found.")
+        return df
+
+    requested = filter_value if filter_value else model_name
+    target = canonical_model_key(requested)
+    keys = df[column].map(canonical_model_key)
+    mask = keys == target
+    filtered = df.loc[mask].copy()
+    if filtered.empty:
+        available = sorted(str(v) for v in df[column].dropna().unique())
+        raise ValueError(
+            f"No rows in '{column}' match model filter '{requested}' (key='{target}'). "
+            f"Available values: {available}"
+        )
+    print(f"[data] model filter: column={column} value={requested} rows={len(filtered)}/{len(df)}")
+    return filtered
 
 
 @dataclass
@@ -37,6 +77,7 @@ class FeatureSpec:
     layer: Optional[int] = None
     mode: InterventionMode = "increase"
     strength: float = 1.0
+    probe_version: str | int | None = None
 
 
 def detect_task(label_series: pd.Series, user_choice: str) -> str:
@@ -70,10 +111,13 @@ def build_generation_prompts(df: pd.DataFrame, args: argparse.Namespace) -> list
 class FeatureProbeContext:
     name: str
     probe: LinearProbe | DecisionTreeProbe | ShallowNNProbe
+    layer: int
     mode: InterventionMode
     strength: float
     class_names: list[str]
     task: str
+    strength_unit: StrengthUnit = "raw"
+    intervene: bool = True
     analytics: list[dict[str, object]] = field(default_factory=list)
     training_metrics: dict[str, float] = field(default_factory=dict)
 
@@ -102,6 +146,8 @@ class FeatureProbeContext:
                 "step": step,
                 "mode": self.mode,
                 "strength": self.strength,
+                "strength_unit": self.strength_unit,
+                "intervene": self.intervene,
                 "tokens_observed": int(probabilities.shape[0]),
                 "class_stats": {tag: summary},
             }
@@ -121,6 +167,7 @@ def parse_feature_specs(raw_specs: Sequence[str]) -> list[FeatureSpec]:
             layer_val = None
         mode: InterventionMode = "increase"
         strength = 1.0
+        probe_version: str | int | None = None
         # parse optional mode / strength robustly
         if len(parts) > 1 and parts[1]:
             candidate = parts[1].lower()
@@ -134,7 +181,17 @@ def parse_feature_specs(raw_specs: Sequence[str]) -> list[FeatureSpec]:
             except ValueError:
                 # if user swapped order, treat as mode
                 mode = parts[2].lower()  # type: ignore[assignment]
-        specs.append(FeatureSpec(label_column=label_column, layer=layer_val, mode=mode, strength=strength))
+        if len(parts) > 3 and parts[3]:
+            probe_version = int(parts[3]) if parts[3].isdigit() else parts[3]
+        specs.append(
+            FeatureSpec(
+                label_column=label_column,
+                layer=layer_val,
+                mode=mode,
+                strength=strength,
+                probe_version=probe_version,
+            )
+        )
     return specs
 
 
@@ -173,15 +230,21 @@ def load_probe_artifact(
     layer: int,
     mode: InterventionMode,
     strength: float,
+    strength_unit: StrengthUnit,
+    intervene: bool = True,
+    probe_version_override: str | int | None = None,
 ) -> FeatureProbeContext:
     candidates: list[Path] = []
+    probe_version: str | int | None = probe_version_override if probe_version_override is not None else args.probe_version
+    if isinstance(probe_version, str) and probe_version.isdigit():
+        probe_version = int(probe_version)
     version_dir = artifact_version_dir(
         kind="probes",
         model_name=args.model_name,
         layer=layer,
         label=label,
         base_dir=args.probe_dir,
-        version="latest",
+        version=probe_version,
     )
     if version_dir:
         candidates.append(version_dir / "probe.pkl")
@@ -223,11 +286,14 @@ def load_probe_artifact(
     return FeatureProbeContext(
         name=label,
         probe=probe,
+        layer=layer,
         mode=mode,
         strength=strength,
         class_names=class_names if class_names else (["value"] if task == "regression" else []),
         task=task,
         training_metrics=training_metrics,
+        strength_unit=strength_unit,
+        intervene=intervene,
     )
 
 
@@ -253,6 +319,50 @@ def resolve_layer_module(model: AutoModelForCausalLM, layer_idx: int):
     raise ValueError(f"Unable to locate layer index {layer_idx} in model '{model.config.model_type}'.")
 
 
+def num_transformer_layers(model: AutoModelForCausalLM) -> int:
+    for attr in ("num_hidden_layers", "n_layer", "num_layers"):
+        value = getattr(model.config, attr, None)
+        if value is not None:
+            return int(value)
+    idx = 0
+    while True:
+        try:
+            resolve_layer_module(model, idx)
+        except ValueError:
+            break
+        idx += 1
+    if idx == 0:
+        raise ValueError(f"Unable to infer layer count for model '{model.config.model_type}'.")
+    return idx
+
+
+def parse_layer_selection(selection: str | None, *, model: AutoModelForCausalLM) -> list[int]:
+    if not selection:
+        return []
+    total_layers = num_transformer_layers(model)
+    raw = selection.strip().lower()
+    if raw == "all":
+        return list(range(total_layers))
+
+    layers: set[int] = set()
+    for part in raw.replace(",", " ").split():
+        if not part:
+            continue
+        if "-" in part:
+            start_raw, end_raw = part.split("-", 1)
+            start = int(start_raw)
+            end = int(end_raw)
+            step = 1 if end >= start else -1
+            layers.update(range(start, end + step, step))
+        else:
+            layers.add(int(part))
+
+    invalid = [layer for layer in layers if layer < 0 or layer >= total_layers]
+    if invalid:
+        raise ValueError(f"Requested collect layers {invalid} outside valid range 0..{total_layers - 1}.")
+    return sorted(layers)
+
+
 class ProbeInterventionHook:
     def __init__(self, contexts: list[FeatureProbeContext], *, layer_idx: int, output_dir: Path) -> None:
         self.contexts = contexts
@@ -265,7 +375,7 @@ class ProbeInterventionHook:
         hidden, payload_type = self._extract_hidden(outputs)
         batch, seq_len, hidden_dim = hidden.shape
         flat = hidden.reshape(-1, hidden_dim)
-        flat_np = flat.detach().cpu().numpy()
+        flat_np = tensor_to_numpy_float(flat)
 
         total_adjustment = torch.zeros_like(flat)
 
@@ -280,6 +390,8 @@ class ProbeInterventionHook:
                     "step": self.step,
                     "mode": ctx.mode,
                     "strength": ctx.strength,
+                    "strength_unit": ctx.strength_unit,
+                    "intervene": ctx.intervene,
                     "tag": "gradient_norm",
                     "source": grad_source,
                     "tokens_observed": int(raw_norms.shape[0]),
@@ -291,9 +403,21 @@ class ProbeInterventionHook:
             )
 
             grad_tensor = torch.from_numpy(raw_gradients).to(flat.device)
+            grad_norm = grad_tensor.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+            grad_unit = grad_tensor / grad_norm
 
-            if self.active:
-                if ctx.mode == "increase":
+            if self.active and ctx.intervene and ctx.strength != 0:
+                if ctx.strength_unit == "activation_pct":
+                    activation_norm = flat.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+                    pct = ctx.strength / 100.0
+                    if ctx.mode == "increase":
+                        adjustment = pct * activation_norm * grad_unit
+                    elif ctx.mode == "decrease":
+                        adjustment = -pct * activation_norm * grad_unit
+                    else:
+                        projection = (flat * grad_unit).sum(dim=-1, keepdim=True)
+                        adjustment = -pct * projection * grad_unit
+                elif ctx.mode == "increase":
                     adjustment = ctx.strength * grad_tensor
                 elif ctx.mode == "decrease":
                     adjustment = -ctx.strength * grad_tensor
@@ -303,11 +427,10 @@ class ProbeInterventionHook:
                 total_adjustment += adjustment
 
             # pre-adjustment stats
-            if pre_scores is None:
-                try:
-                    pre_scores = ctx.probe.predict_proba(flat_np)
-                except Exception:
-                    pre_scores = ctx.probe.predict(flat_np)
+            try:
+                pre_scores = ctx.probe.predict_proba(flat_np)
+            except Exception:
+                pre_scores = ctx.probe.predict(flat_np)
             pre_arr = np.asarray(pre_scores)
             if pre_arr.ndim == 1:
                 pre_arr = pre_arr.reshape(-1, 1)
@@ -316,7 +439,7 @@ class ProbeInterventionHook:
         flat = flat + total_adjustment
         # post-adjustment stats
         for ctx in self.contexts:
-            adjusted_np = flat.detach().cpu().numpy()
+            adjusted_np = tensor_to_numpy_float(flat)
             try:
                 post_scores = ctx.probe.predict_proba(adjusted_np)
             except Exception:
@@ -344,7 +467,7 @@ def read_prompts(path: Path) -> list[str]:
     return [line.strip() for line in path.read_text().splitlines() if line.strip()]
 
 
-def compute_logprobs_and_entropy(outputs, generated_ids: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
+def compute_logprobs_and_entropy(outputs, generated_ids: torch.Tensor, *, chunk_size: int = 16) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute logprobs for generated/chosen tokens and token-wise entropy.
     Entropy is derived from the full distribution at each step.
@@ -359,8 +482,8 @@ def compute_logprobs_and_entropy(outputs, generated_ids: torch.Tensor) -> tuple[
             entropy = -(probs * logp).sum(dim=-1)
             token_ids = generated_ids[:, step]
             token_logprobs = logp.gather(1, token_ids.view(-1, 1)).squeeze(1)
-            logprobs.append(token_logprobs.cpu().numpy())
-            entropies.append(entropy.cpu().numpy())
+            logprobs.append(tensor_to_numpy_float(token_logprobs))
+            entropies.append(tensor_to_numpy_float(entropy))
         return np.stack(logprobs, axis=1), np.stack(entropies, axis=1)
 
     logits = getattr(outputs, "logits", None)
@@ -374,22 +497,30 @@ def compute_logprobs_and_entropy(outputs, generated_ids: torch.Tensor) -> tuple[
         zeros = np.zeros((target.size(0), target.size(1)), dtype=np.float32)
         return zeros, zeros
 
-    logits = logits[:, : max_t - 1, :]
     target = target[:, 1:max_t]
-    log_probs_full = torch.log_softmax(logits, dim=-1)
-    probs_full = torch.softmax(logits, dim=-1)
-    gathered = log_probs_full.gather(2, target.unsqueeze(-1)).squeeze(-1)  # [batch, max_t-1]
-    entropy = -(probs_full * log_probs_full).sum(dim=-1)  # [batch, max_t-1]
+    gathered_chunks: list[torch.Tensor] = []
+    entropy_chunks: list[torch.Tensor] = []
+    for start in range(0, max_t - 1, max(1, chunk_size)):
+        end = min(max_t - 1, start + max(1, chunk_size))
+        logits_chunk = logits[:, start:end, :]
+        target_chunk = target[:, start:end]
+        log_probs_chunk = torch.log_softmax(logits_chunk, dim=-1)
+        probs_chunk = torch.exp(log_probs_chunk)
+        gathered_chunks.append(log_probs_chunk.gather(2, target_chunk.unsqueeze(-1)).squeeze(-1).detach().float().cpu())
+        entropy_chunks.append((-(probs_chunk * log_probs_chunk).sum(dim=-1)).detach().float().cpu())
+        del logits_chunk, target_chunk, log_probs_chunk, probs_chunk
+    gathered = torch.cat(gathered_chunks, dim=1)
+    entropy = torch.cat(entropy_chunks, dim=1)
 
-    pad = torch.full((gathered.size(0), 1), float("nan"), device=gathered.device)
-    pad_h = torch.full((entropy.size(0), 1), float("nan"), device=entropy.device)
+    pad = torch.full((gathered.size(0), 1), float("nan"))
+    pad_h = torch.full((entropy.size(0), 1), float("nan"))
     seq_logprobs = torch.cat([pad, gathered], dim=1)
     seq_entropy = torch.cat([pad_h, entropy], dim=1)
 
     if seq_logprobs.size(1) < generated_ids.size(1):
         tail = generated_ids.size(1) - seq_logprobs.size(1)
-        pad_tail_lp = torch.full((seq_logprobs.size(0), tail), float("nan"), device=seq_logprobs.device)
-        pad_tail_ent = torch.full((seq_entropy.size(0), tail), float("nan"), device=seq_entropy.device)
+        pad_tail_lp = torch.full((seq_logprobs.size(0), tail), float("nan"))
+        pad_tail_ent = torch.full((seq_entropy.size(0), tail), float("nan"))
         seq_logprobs = torch.cat([seq_logprobs, pad_tail_lp], dim=1)
         seq_entropy = torch.cat([seq_entropy, pad_tail_ent], dim=1)
 
@@ -408,148 +539,188 @@ def run_generation(
     generate_new_tokens: bool = True,
     hook_active: bool = True,
 ):
-    hook = None
     cos_records: list[dict[str, object]] = []
     hooks: list[torch.utils.hooks.RemovableHandle] = []
     if contexts_by_layer:
         for layer_idx, ctxs in contexts_by_layer.items():
+            hook_contexts = [ctx for ctx in ctxs if ctx.intervene]
+            if not hook_contexts:
+                continue
             module = resolve_layer_module(model, layer_idx)
-            intervention_hook = ProbeInterventionHook(ctxs, layer_idx=layer_idx, output_dir=out_dir)
+            intervention_hook = ProbeInterventionHook(hook_contexts, layer_idx=layer_idx, output_dir=out_dir)
             intervention_hook.active = hook_active
             hooks.append(module.register_forward_hook(intervention_hook))
+    try:
+        tokenizer.padding_side = "left"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-    tokenizer.padding_side = "left"
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
+        generations: list[str] = []
+        all_logprobs: list[np.ndarray] = []
+        all_entropy: list[np.ndarray] = []
+        all_token_ids: list[np.ndarray] = []
+        per_token_preds: list[dict[str, list[float]]] = []
+        batch_size = max(1, args.generation_batch_size)
+        run_label = f"{'intervention' if hook_active else 'baseline'}_{'new' if generate_new_tokens else 'old'}"
+        batch_starts = range(0, len(prompts), batch_size)
+        total_batches = len(batch_starts)
+        progress_style = "none" if args.no_progress else args.progress_style
+        if progress_style == "tqdm":
+            batch_iter = tqdm(
+                batch_starts,
+                desc=run_label,
+                unit="batch",
+                dynamic_ncols=True,
+            )
+        else:
+            batch_iter = batch_starts
+            if progress_style == "line":
+                print(f"[progress] {run_label} batches={total_batches} batch_size={batch_size}", flush=True)
 
-    generations: list[str] = []
-    all_logprobs: list[np.ndarray] = []
-    all_entropy: list[np.ndarray] = []
-    all_token_ids: list[np.ndarray] = []
-    last_outputs = None
-    per_token_preds: list[dict[str, list[float]]] = []
-    batch_size = max(1, args.generation_batch_size)
-    for start in range(0, len(prompts), batch_size):
-        batch_prompts = prompts[start : start + batch_size]
-        enc = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
-        with torch.no_grad():
-            if generate_new_tokens:
-                outputs = model.generate(
-                    **enc,
-                    max_new_tokens=args.max_new_tokens,
-                    do_sample=args.do_sample,
-                    temperature=args.temperature,
-                    top_p=args.top_p,
-                    return_dict_in_generate=True,
-                    output_scores=True,
+        for start in batch_iter:
+            batch_start_time = time.perf_counter()
+            batch_num = (start // batch_size) + 1
+            batch_prompts = prompts[start : start + batch_size]
+            layers_scored = 0
+            enc = None
+            outputs = None
+            sequences = None
+            generated_ids = None
+            hidden_states = None
+            layer_states = None
+            enc_for_hidden = None
+            try:
+                enc = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
+                with torch.no_grad():
+                    if generate_new_tokens:
+                        outputs = model.generate(
+                            **enc,
+                            max_new_tokens=args.max_new_tokens,
+                            do_sample=args.do_sample,
+                            temperature=args.temperature,
+                            top_p=args.top_p,
+                            return_dict_in_generate=True,
+                            output_scores=True,
+                        )
+                        sequences = outputs.sequences
+                        generated_ids = sequences[:, enc.input_ids.shape[1] :]
+                    else:
+                        outputs = model(**enc, output_hidden_states=True)
+                        generated_ids = enc.input_ids  # evaluate plausibility of existing sequence
+
+                # If no new tokens, still capture the prompt (or empty generation)
+                generations.extend(tokenizer.batch_decode(generated_ids, skip_special_tokens=True) if generate_new_tokens else [""] * enc.input_ids.size(0))
+                lp, ent = compute_logprobs_and_entropy(outputs, generated_ids, chunk_size=args.logprob_chunk_size)
+                all_logprobs.append(lp)
+                all_entropy.append(ent)
+                all_token_ids.extend(list(generated_ids.cpu().numpy()))
+                if contexts_by_layer:
+                    # compute gradient cosines on this batch of hidden states
+                    with torch.no_grad():
+                        attention_mask = enc["attention_mask"]
+                        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
+                            hidden_states = outputs.hidden_states
+                        else:
+                            enc_for_hidden = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
+                            hidden_states = model(**enc_for_hidden, output_hidden_states=True).hidden_states
+                            attention_mask = enc_for_hidden["attention_mask"]
+                        # align mask and hidden length defensively
+                        seq_len = min(attention_mask.shape[1], hidden_states[0].shape[1])
+                        attention_mask = attention_mask[:, :seq_len]
+                        total_layers = len(hidden_states)
+                        layer_items = sorted(contexts_by_layer.items(), key=lambda kv: kv[0])
+                        for layer_idx, ctxs in layer_items:
+                            layers_scored += 1
+                            # hidden_states includes embeddings at position 0; shift positives by +1
+                            idx = layer_idx + 1 if layer_idx >= 0 else total_layers + layer_idx
+                            if idx < 0 or idx >= total_layers:
+                                raise IndexError(f"Requested layer index {layer_idx} maps to hidden_states[{idx}] out of range 0..{total_layers-1}")
+                            layer_states = hidden_states[idx][:, :seq_len, :]
+                            valid_mask = attention_mask.bool()
+                            flat = tensor_to_numpy_float(layer_states[valid_mask])
+                            cos_records.extend(compute_gradient_cosines(ctxs, flat, layer=layer_idx))
+
+                            # per-token probe predictions
+                            batch_size_cur = layer_states.size(0)
+                            seq_len_cur = layer_states.size(1)
+                            for ctx in ctxs:
+                                try:
+                                    preds = ctx.probe.predict_proba(flat)
+                                    if preds.ndim == 2 and preds.shape[1] > 1:
+                                        preds_scalar = preds[:, 1]  # prob of class 1
+                                    else:
+                                        preds_scalar = preds.reshape(-1)
+                                except Exception:
+                                    try:
+                                        preds = ctx.probe.predict(flat)
+                                        preds_scalar = np.asarray(preds).reshape(-1)
+                                    except Exception:
+                                        preds_scalar = np.full(flat.shape[0], np.nan)
+
+                                filled = np.full((batch_size_cur, seq_len_cur), np.nan, dtype=float)
+                                flat_idx = 0
+                                vm = valid_mask.cpu().numpy()
+                                for bi in range(batch_size_cur):
+                                    positions = np.nonzero(vm[bi])[0]
+                                    count = len(positions)
+                                    if count > 0:
+                                        filled[bi, positions] = preds_scalar[flat_idx : flat_idx + count]
+                                        flat_idx += count
+
+                                # ensure per_token_preds has entries
+                                pred_key = f"{ctx.name}_L{layer_idx}"
+                                while len(per_token_preds) < start + batch_size_cur:
+                                    per_token_preds.append({})
+                                for bi in range(batch_size_cur):
+                                    idx_global = start + bi
+                                    if idx_global >= len(per_token_preds):
+                                        per_token_preds.append({})
+                                    entry = per_token_preds[idx_global]
+                                    entry[pred_key] = filled[bi].tolist()
+
+            finally:
+                del outputs, sequences, generated_ids, hidden_states, layer_states, enc_for_hidden, enc
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            if progress_style == "line":
+                elapsed = time.perf_counter() - batch_start_time
+                print(
+                    f"[progress] {run_label} batch={batch_num}/{total_batches} "
+                    f"rows={len(batch_prompts)} probe_layers={layers_scored} elapsed={elapsed:.1f}s",
+                    flush=True,
                 )
-                last_outputs = outputs
-                sequences = outputs.sequences
-                generated_ids = sequences[:, enc.input_ids.shape[1] :]
-            else:
-                outputs = model(**enc, output_hidden_states=True)
-                last_outputs = outputs
-                generated_ids = enc.input_ids  # evaluate plausibility of existing sequence
 
-        # If no new tokens, still capture the prompt (or empty generation)
-        generations.extend(tokenizer.batch_decode(generated_ids, skip_special_tokens=True) if generate_new_tokens else [""] * enc.input_ids.size(0))
-        lp, ent = compute_logprobs_and_entropy(outputs, generated_ids)
-        all_logprobs.append(lp)
-        all_entropy.append(ent)
-        all_token_ids.extend(list(generated_ids.cpu().numpy()))
-        if contexts_by_layer:
-            # compute gradient cosines on this batch of hidden states
-            with torch.no_grad():
-                if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-                    hidden_states = outputs.hidden_states
-                else:
-                    enc_for_hidden = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
-                    hidden_states = model(**enc_for_hidden, output_hidden_states=True).hidden_states
-                    attention_mask = enc_for_hidden["attention_mask"]
-                if 'attention_mask' not in locals():
-                    attention_mask = enc.get("attention_mask")
-                # align mask and hidden length defensively
-                seq_len = min(attention_mask.shape[1], hidden_states[0].shape[1])
-                attention_mask = attention_mask[:, :seq_len]
-                total_layers = len(hidden_states)
-                for layer_idx, ctxs in contexts_by_layer.items():
-                    # hidden_states includes embeddings at position 0; shift positives by +1
-                    idx = layer_idx + 1 if layer_idx >= 0 else total_layers + layer_idx
-                    if idx < 0 or idx >= total_layers:
-                        raise IndexError(f"Requested layer index {layer_idx} maps to hidden_states[{idx}] out of range 0..{total_layers-1}")
-                    layer_states = hidden_states[idx][:, :seq_len, :]
-                    valid_mask = attention_mask.bool()
-                    flat = layer_states[valid_mask].detach().cpu().numpy()
-                    cos_records.extend(compute_gradient_cosines(ctxs, flat, layer=layer_idx))
+        def pad_and_concat(arrs: list[np.ndarray]) -> np.ndarray | None:
+            if not arrs:
+                return None
+            max_cols = max(arr.shape[1] for arr in arrs)
+            padded = []
+            for arr in arrs:
+                if arr.shape[1] < max_cols:
+                    pad_width = ((0, 0), (0, max_cols - arr.shape[1]))
+                    arr = np.pad(arr, pad_width, constant_values=np.nan)
+                padded.append(arr)
+            return np.concatenate(padded, axis=0)
 
-                    # per-token probe predictions
-                    batch_size_cur = layer_states.size(0)
-                    seq_len_cur = layer_states.size(1)
-                    for ctx in ctxs:
-                        try:
-                            preds = ctx.probe.predict_proba(flat)
-                            if preds.ndim == 2 and preds.shape[1] > 1:
-                                preds_scalar = preds[:, 1]  # prob of class 1
-                            else:
-                                preds_scalar = preds.reshape(-1)
-                        except Exception:
-                            try:
-                                preds = ctx.probe.predict(flat)
-                                preds_scalar = np.asarray(preds).reshape(-1)
-                            except Exception:
-                                preds_scalar = np.full(flat.shape[0], np.nan)
+        logprobs_concat = pad_and_concat(all_logprobs)
+        entropy_concat = pad_and_concat(all_entropy)
+        # ensure per_token_preds aligns with prompt count
+        while len(per_token_preds) < len(prompts):
+            per_token_preds.append({})
 
-                        filled = np.full((batch_size_cur, seq_len_cur), np.nan, dtype=float)
-                        flat_idx = 0
-                        vm = valid_mask.cpu().numpy()
-                        for bi in range(batch_size_cur):
-                            positions = np.nonzero(vm[bi])[0]
-                            count = len(positions)
-                            if count > 0:
-                                filled[bi, positions] = preds_scalar[flat_idx : flat_idx + count]
-                                flat_idx += count
-
-                        # ensure per_token_preds has entries
-                        pred_key = f"{ctx.name}_L{layer_idx}"
-                        while len(per_token_preds) < start + batch_size_cur:
-                            per_token_preds.append({})
-                        for bi in range(batch_size_cur):
-                            idx_global = start + bi
-                            if idx_global >= len(per_token_preds):
-                                per_token_preds.append({})
-                            entry = per_token_preds[idx_global]
-                            entry[pred_key] = filled[bi].tolist()
-
-    for h in hooks:
-        h.remove()
-
-    def pad_and_concat(arrs: list[np.ndarray]) -> np.ndarray | None:
-        if not arrs:
-            return None
-        max_cols = max(arr.shape[1] for arr in arrs)
-        padded = []
-        for arr in arrs:
-            if arr.shape[1] < max_cols:
-                pad_width = ((0, 0), (0, max_cols - arr.shape[1]))
-                arr = np.pad(arr, pad_width, constant_values=np.nan)
-            padded.append(arr)
-        return np.concatenate(padded, axis=0)
-
-    logprobs_concat = pad_and_concat(all_logprobs)
-    entropy_concat = pad_and_concat(all_entropy)
-    # ensure per_token_preds aligns with prompt count
-    while len(per_token_preds) < len(prompts):
-        per_token_preds.append({})
-
-    return (
-        generations,
-        last_outputs,
-        logprobs_concat,
-        entropy_concat,
-        all_token_ids,
-        cos_records,
-        per_token_preds,
-    )
+        return (
+            generations,
+            None,
+            logprobs_concat,
+            entropy_concat,
+            all_token_ids,
+            cos_records,
+            per_token_preds,
+        )
+    finally:
+        for h in hooks:
+            h.remove()
 
 
 def save_token_stats(
@@ -563,17 +734,15 @@ def save_token_stats(
     contexts: Optional[list[FeatureProbeContext]] = None,
     token_preds: Optional[list[dict[str, list[float]]]] = None,
     tag: str = "token_stats",
-    column_suffix: str = "",
     file_format: str = "parquet",   # "parquet" or "csv"
     include_token_text: bool = False,
     skip_special_tokens: bool = False,
     chunk_size: int = 200_000,
 ) -> Path:
     """
-    Long-format token stats writer.
-    One row per (prompt_index, token_index, feature). If no features exist, one row per token.
+    Wide-format token stats writer.
+    One row per (prompt_index, token_index) with one prediction column per feature/layer key.
     """
-    import re
     import math
     import pandas as pd
 
@@ -584,23 +753,14 @@ def save_token_stats(
     if fmt not in {"csv", "parquet"}:
         raise ValueError("file_format must be 'csv' or 'parquet'.")
 
-    # Feature metadata from contexts
-    feature_meta: dict[str, dict[str, object]] = {}
+    feature_names: set[str] = set()
     if contexts:
         for ctx in contexts:
-            k = f"{ctx.name}{column_suffix}"
-            feature_meta[k] = {
-                "mode": ctx.mode,
-                "strength": float(ctx.strength),
-                "task": ctx.task,
-            }
-
-    # Feature keys also from predictions map
-    feature_names = set(feature_meta.keys())
+            feature_names.add(f"{ctx.name}_L{ctx.layer}")
     if token_preds:
         for entry in token_preds:
             feature_names.update(entry.keys())
-    feature_names = sorted(feature_names)
+    feature_columns = sorted(feature_names)
 
     # Try parquet writer (chunk-append)
     parquet_writer = None
@@ -626,15 +786,6 @@ def save_token_stats(
     if pad_id is not None:
         all_special_ids.add(int(pad_id))
 
-    # Parse layer from feature key suffix "..._L<idx>"
-    layer_pat = re.compile(r"^(?P<name>.+)_L(?P<layer>-?\d+)$")
-
-    def split_feature_layer(feature_key: str) -> tuple[str, Optional[int]]:
-        m = layer_pat.match(feature_key)
-        if not m:
-            return feature_key, None
-        return m.group("name"), int(m.group("layer"))
-
     columns = [
         "tag",
         "prompt_index",
@@ -644,14 +795,7 @@ def save_token_stats(
         "is_special",
         "logprob",
         "entropy",
-        "feature_key",
-        "feature_name",
-        "layer",
-        "mode",
-        "strength",
-        "task",
-        "pred",
-    ]
+    ] + feature_columns
 
     rows: list[tuple] = []
     csv_header_written = False
@@ -663,7 +807,7 @@ def save_token_stats(
         df = pd.DataFrame.from_records(rows, columns=columns)
 
         # keep storage compact
-        for c in ("logprob", "entropy", "strength", "pred"):
+        for c in ("logprob", "entropy", *feature_columns):
             df[c] = df[c].astype("float32")
         df["is_special"] = df["is_special"].astype("bool")
         df["token_id"] = df["token_id"].astype("int32")
@@ -712,51 +856,20 @@ def save_token_stats(
             lp_val = float(lp_row[j]) if lp_row is not None else math.nan
             ent_val = float(ent_row[j]) if ent_row is not None else math.nan
 
-            if feature_names:
-                for fk in feature_names:
-                    vals = preds_map.get(fk)
-                    pred = float(vals[j]) if (vals is not None and j < len(vals)) else math.nan
-                    f_name, f_layer = split_feature_layer(fk)
-                    meta = feature_meta.get(fk, {})
-                    rows.append(
-                        (
-                            tag,
-                            i,
-                            j,
-                            tid,
-                            token_text,
-                            is_special,
-                            lp_val,
-                            ent_val,
-                            fk,
-                            f_name,
-                            f_layer,
-                            meta.get("mode", ""),
-                            float(meta.get("strength", math.nan)),
-                            meta.get("task", ""),
-                            pred,
-                        )
-                    )
-            else:
-                rows.append(
-                    (
-                        tag,
-                        i,
-                        j,
-                        tid,
-                        token_text,
-                        is_special,
-                        lp_val,
-                        ent_val,
-                        "",
-                        "",
-                        None,
-                        "",
-                        math.nan,
-                        "",
-                        math.nan,
-                    )
-                )
+            row = [
+                tag,
+                i,
+                j,
+                tid,
+                token_text,
+                is_special,
+                lp_val,
+                ent_val,
+            ]
+            for fk in feature_columns:
+                vals = preds_map.get(fk)
+                row.append(float(vals[j]) if (vals is not None and j < len(vals)) else math.nan)
+            rows.append(tuple(row))
 
             if len(rows) >= chunk_size:
                 flush_rows()
@@ -862,6 +975,27 @@ def save_gradient_cosines(
             )
 
 
+def save_probe_analytics(output_dir: Path, contexts: list[FeatureProbeContext]) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payload = []
+    for ctx in contexts:
+        payload.append(
+            {
+                "feature": ctx.name,
+                "layer": ctx.layer,
+                "mode": ctx.mode,
+                "strength": ctx.strength,
+                "strength_unit": ctx.strength_unit,
+                "intervene": ctx.intervene,
+                "task": ctx.task,
+                "class_names": ctx.class_names,
+                "training_metrics": ctx.training_metrics,
+                "analytics": ctx.analytics,
+            }
+        )
+    save_json({"contexts": payload}, output_dir / "probe_analytics.json")
+
+
 def save_metadata(
     output_dir: Path,
     args: argparse.Namespace,
@@ -877,11 +1011,14 @@ def save_metadata(
         "model_name": args.model_name,
         "layers": layers,
         "probe_dir": args.probe_dir,
+        "probe_version": args.probe_version,
         "probe_type": args.probe_type,
         "data_path": args.data_path,
         "data_hash": data_hash,
         "sheet": args.sheet,
         "features": [spec.__dict__ for spec in feature_specs],
+        "strength_unit": args.strength_unit,
+        "collect_probe_layers": args.collect_probe_layers,
         "dtype": args.dtype,
         "seed": args.seed,
         "max_samples": args.max_samples,
@@ -902,14 +1039,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-name", required=True)
     parser.add_argument("--data-path", required=True)
     parser.add_argument("--sheet", default=None, help="Optional worksheet name (xlsx only).")
+    parser.add_argument("--model-filter-column", default="model_name",
+                        help="If present in the dataset, keep only rows whose model name matches --model-name.")
+    parser.add_argument("--model-filter-value", default=None,
+                        help="Explicit dataset model_name value to filter for, overriding --model-name matching.")
+    parser.add_argument("--no-model-filter", action="store_true",
+                        help="Disable filtering dataset rows by --model-name.")
     parser.add_argument("--layer", type=int, default=None, help="Optional default layer applied to any feature without an explicit layer.")
     parser.add_argument("--probe-dir", default="artifacts/probes", help="Directory containing pre-trained probe artifacts.")
+    parser.add_argument("--probe-version", default="latest", help="Probe artifact version to load, e.g. 'latest' or '73'.")
     parser.add_argument("--text-column", default=None)
     parser.add_argument("--prompt-template", default=PROMPT_TEMPLATE)
     parser.add_argument("--template-fields", nargs="+", default=["gender", "level", "trait", "belief", "question", "type", "pronoun"])
     parser.add_argument("--response-column", default="response")
     parser.add_argument("--feature", dest="feature_specs", action="append", required=True,
-                        help="Format: label_column[:mode[:strength]]. Mode ∈ {increase,decrease,project}.")
+                        help="Format: label_column[:mode[:strength[:probe_version]]]. Mode ∈ {increase,decrease,project}.")
+    parser.add_argument("--collect-feature", dest="collect_feature_specs", action="append", default=[],
+                        help="Additional label_column[:mode[:strength[:probe_version]]] probes to score without intervening. Layers come from --collect-probe-layers unless annotated as label@layer.")
+    parser.add_argument("--strength-unit", choices=["raw", "activation_pct"], default="raw",
+                        help="raw: multiply raw probe gradient by strength. activation_pct: strength is percent of activation norm along normalized probe direction.")
+    parser.add_argument("--collect-probe-layers", default=None,
+                        help="Additional layers to observe for every requested feature without intervening. Use 'all', '0,4,8', or ranges like '0-31'.")
     parser.add_argument("--probe-type", choices=["linear", "decision_tree", "shallow_nn"], default="linear",
                         help="Probe type used in artifact naming (no training happens here).")
     parser.add_argument("--output-dir", default="artifacts/experiments", help="Base directory for experiment outputs.")
@@ -931,12 +1081,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--do-sample", action="store_true")
     parser.add_argument("--generation-batch-size", type=int, default=4, help="Batch size for generation to manage memory.")
+    parser.add_argument("--logprob-chunk-size", type=int, default=16,
+                        help="Sequence chunk size for full-vocabulary logprob/entropy computation; lower values reduce GPU memory.")
     parser.add_argument("--token-stats-format", choices=["csv", "parquet"], default="parquet",
                         help="Storage format for token-level statistics.")
     parser.add_argument("--token-stats-include-text", action="store_true",
                         help="Include decoded token text in token-level outputs (larger files).")
     parser.add_argument("--token-stats-skip-special", action="store_true",
                         help="Skip special tokens when exporting token-level stats.")
+    parser.add_argument("--progress-style", choices=["line", "tqdm", "none"], default="line",
+                        help="Progress reporting style. 'line' is Slurm-friendly; 'tqdm' is better for interactive terminals.")
+    parser.add_argument("--no-progress", action="store_true",
+                        help="Disable progress reporting.")
     return parser.parse_args()
 
 
@@ -958,11 +1114,26 @@ def main() -> None:
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    model = AutoModelForCausalLM.from_pretrained(args.model_name)
+    dtype_map = {
+        "float32": torch.float32,
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+    }
+    try:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, dtype=dtype_map[args.dtype])
+    except TypeError:
+        model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=dtype_map[args.dtype])
     model.to(device)
     model.eval()
 
     df = load_table(args.data_path, sheet=args.sheet)
+    if not args.no_model_filter:
+        df = filter_rows_for_model(
+            df,
+            model_name=args.model_name,
+            column=args.model_filter_column,
+            filter_value=args.model_filter_value,
+        )
     data_hash = sha256_file(args.data_path)
     text_series, filtered_df = build_text_series(
         df,
@@ -976,13 +1147,14 @@ def main() -> None:
     feature_specs = parse_feature_specs(args.feature_specs)
     contexts_by_layer: dict[int, list[FeatureProbeContext]] = {}
     layers: set[int] = set()
+    context_keys: set[tuple[str, int]] = set()
 
     for spec in feature_specs:
         resolved_layer = spec.layer if spec.layer is not None else args.layer
         if resolved_layer is None:
             raise ValueError("No layer specified. Provide --layer or annotate each --feature with @<layer>.")
         layers.add(resolved_layer)
-        print(f"[load] feature={spec.label_column} mode={spec.mode} strength={spec.strength}")
+        print(f"[load] feature={spec.label_column} layer={resolved_layer} mode={spec.mode} strength={spec.strength} unit={args.strength_unit} intervene=1")
         context = load_probe_artifact(
             spec.label_column,
             args,
@@ -990,8 +1162,70 @@ def main() -> None:
             layer=resolved_layer,
             mode=spec.mode,
             strength=spec.strength,
+            strength_unit=args.strength_unit,
+            intervene=True,
+            probe_version_override=spec.probe_version,
         )
         contexts_by_layer.setdefault(resolved_layer, []).append(context)
+        context_keys.add((spec.label_column, resolved_layer))
+
+    collect_layers = parse_layer_selection(args.collect_probe_layers, model=model)
+    if collect_layers:
+        for spec in feature_specs:
+            for collect_layer in collect_layers:
+                key = (spec.label_column, collect_layer)
+                if key in context_keys:
+                    continue
+                print(f"[load] feature={spec.label_column} layer={collect_layer} mode={spec.mode} strength=0.0 unit={args.strength_unit} intervene=0")
+                try:
+                    context = load_probe_artifact(
+                        spec.label_column,
+                        args,
+                        device=device,
+                        layer=collect_layer,
+                        mode=spec.mode,
+                        strength=0.0,
+                        strength_unit=args.strength_unit,
+                        intervene=False,
+                        probe_version_override=spec.probe_version,
+                    )
+                except FileNotFoundError as exc:
+                    print(f"[warn] skipping missing collection probe: {exc}")
+                    continue
+                contexts_by_layer.setdefault(collect_layer, []).append(context)
+                context_keys.add(key)
+                layers.add(collect_layer)
+
+    if args.collect_feature_specs:
+        collect_feature_specs = parse_feature_specs(args.collect_feature_specs)
+        fallback_layers = collect_layers if collect_layers else sorted(layers)
+        for spec in collect_feature_specs:
+            target_layers = [spec.layer] if spec.layer is not None else fallback_layers
+            if not target_layers:
+                raise ValueError("No collection layers available. Set --collect-probe-layers, --layer, or use collect-feature@layer.")
+            for collect_layer in target_layers:
+                key = (spec.label_column, collect_layer)
+                if key in context_keys:
+                    continue
+                print(f"[load] collect_feature={spec.label_column} layer={collect_layer} mode={spec.mode} strength=0.0 unit={args.strength_unit} intervene=0")
+                try:
+                    context = load_probe_artifact(
+                        spec.label_column,
+                        args,
+                        device=device,
+                        layer=collect_layer,
+                        mode=spec.mode,
+                        strength=0.0,
+                        strength_unit=args.strength_unit,
+                        intervene=False,
+                        probe_version_override=spec.probe_version,
+                    )
+                except FileNotFoundError as exc:
+                    print(f"[warn] skipping missing collection probe: {exc}")
+                    continue
+                contexts_by_layer.setdefault(collect_layer, []).append(context)
+                context_keys.add(key)
+                layers.add(collect_layer)
 
     # Prompts for new generation (no responses), and full texts (with responses) for old-answer passes.
     gen_prompts = build_generation_prompts(filtered_df, args)
@@ -1054,72 +1288,67 @@ def main() -> None:
         hook_active=True,
     )
 
-    layer_items = sorted(contexts_by_layer.items(), key=lambda kv: kv[0])
-    for layer_idx, layer_contexts in layer_items:
-        suffix = f"_L{layer_idx}"
-        save_token_stats(
-            out_dir,
-            tokenizer,
-            prompts=full_texts,
-            token_ids=neutral_token_ids,
-            logprobs=neutral_logprobs,
-            entropy=neutral_entropy,
-            contexts=layer_contexts,
-            token_preds=neutral_token_preds,
-            tag=f"token_stats_baseline_old{suffix}",
-            column_suffix=suffix,
-            file_format=args.token_stats_format,
-            include_token_text=args.token_stats_include_text,
-            skip_special_tokens=args.token_stats_skip_special,
-        )
+    all_contexts = [ctx for _, layer_contexts in sorted(contexts_by_layer.items(), key=lambda kv: kv[0]) for ctx in layer_contexts]
 
-        save_token_stats(
-            out_dir,
-            tokenizer,
-            prompts=full_texts,
-            token_ids=active_token_ids,
-            logprobs=active_logprobs,
-            entropy=active_entropy,
-            contexts=layer_contexts,
-            token_preds=active_token_preds,
-            tag=f"token_stats_intervention_old{suffix}",
-            column_suffix=suffix,
-            file_format=args.token_stats_format,
-            include_token_text=args.token_stats_include_text,
-            skip_special_tokens=args.token_stats_skip_special,
-        )
+    save_token_stats(
+        out_dir,
+        tokenizer,
+        prompts=full_texts,
+        token_ids=neutral_token_ids,
+        logprobs=neutral_logprobs,
+        entropy=neutral_entropy,
+        contexts=all_contexts,
+        token_preds=neutral_token_preds,
+        tag="token_stats_baseline_old",
+        file_format=args.token_stats_format,
+        include_token_text=args.token_stats_include_text,
+        skip_special_tokens=args.token_stats_skip_special,
+    )
 
-        save_token_stats(
-            out_dir,
-            tokenizer,
-            prompts=gen_prompts,
-            token_ids=baseline_token_ids,
-            logprobs=baseline_logprobs,
-            entropy=baseline_entropy,
-            contexts=layer_contexts,
-            token_preds=baseline_token_preds,
-            tag=f"token_stats_baseline_new{suffix}",
-            column_suffix=suffix,
-            file_format=args.token_stats_format,
-            include_token_text=args.token_stats_include_text,
-            skip_special_tokens=args.token_stats_skip_special,
-        )
+    save_token_stats(
+        out_dir,
+        tokenizer,
+        prompts=full_texts,
+        token_ids=active_token_ids,
+        logprobs=active_logprobs,
+        entropy=active_entropy,
+        contexts=all_contexts,
+        token_preds=active_token_preds,
+        tag="token_stats_intervention_old",
+        file_format=args.token_stats_format,
+        include_token_text=args.token_stats_include_text,
+        skip_special_tokens=args.token_stats_skip_special,
+    )
 
-        save_token_stats(
-            out_dir,
-            tokenizer,
-            prompts=gen_prompts,
-            token_ids=token_ids,
-            logprobs=logprobs,
-            entropy=entropy,
-            contexts=layer_contexts,
-            token_preds=intervened_token_preds,
-            tag=f"token_stats_intervention_new{suffix}",
-            column_suffix=suffix,
-            file_format=args.token_stats_format,
-            include_token_text=args.token_stats_include_text,
-            skip_special_tokens=args.token_stats_skip_special,
-        )
+    save_token_stats(
+        out_dir,
+        tokenizer,
+        prompts=gen_prompts,
+        token_ids=baseline_token_ids,
+        logprobs=baseline_logprobs,
+        entropy=baseline_entropy,
+        contexts=all_contexts,
+        token_preds=baseline_token_preds,
+        tag="token_stats_baseline_new",
+        file_format=args.token_stats_format,
+        include_token_text=args.token_stats_include_text,
+        skip_special_tokens=args.token_stats_skip_special,
+    )
+
+    save_token_stats(
+        out_dir,
+        tokenizer,
+        prompts=gen_prompts,
+        token_ids=token_ids,
+        logprobs=logprobs,
+        entropy=entropy,
+        contexts=all_contexts,
+        token_preds=intervened_token_preds,
+        tag="token_stats_intervention_new",
+        file_format=args.token_stats_format,
+        include_token_text=args.token_stats_include_text,
+        skip_special_tokens=args.token_stats_skip_special,
+    )
 
     save_generations(
         out_dir,
@@ -1163,6 +1392,7 @@ def main() -> None:
 
     all_cos = cos_records + neutral_cos + active_cos + baseline_cos
     save_gradient_cosines(out_dir, all_cos)
+    save_probe_analytics(out_dir, all_contexts)
 
     save_metadata(out_dir, args, feature_specs, sorted(layers), data_hash=data_hash)
 

@@ -13,11 +13,38 @@ import numpy as np
 import pandas as pd
 
 
-def load_csv(path: Path) -> Optional[pd.DataFrame]:
-    if path.exists():
+def load_table(path: Path) -> Optional[pd.DataFrame]:
+    if not path.exists():
+        print(f"[warn] Missing {path}")
+        return None
+    if path.suffix == ".parquet":
+        return pd.read_parquet(path)
+    if path.suffix == ".csv":
         return pd.read_csv(path)
-    print(f"[warn] Missing {path}")
+    raise ValueError(f"Unsupported table format for {path}")
+
+
+def resolve_existing_path(candidates: Sequence[Path]) -> Optional[Path]:
+    for path in candidates:
+        if path.exists():
+            return path
     return None
+
+
+def resolve_token_stats_path(exp_dir: Path, kind: str, split: str, layer: int | None) -> Optional[Path]:
+    suffix = f"_L{layer}" if layer is not None else ""
+    candidates = [
+        exp_dir / f"token_stats_{kind}_{split}{suffix}.parquet",
+        exp_dir / f"token_stats_{kind}_{split}{suffix}.csv",
+    ]
+    if layer is not None:
+        candidates.extend(
+            [
+                exp_dir / f"token_stats_{kind}_{split}.parquet",
+                exp_dir / f"token_stats_{kind}_{split}.csv",
+            ]
+        )
+    return resolve_existing_path(candidates)
 
 
 def save_plot(fig, out_path: Path) -> None:
@@ -50,6 +77,18 @@ def merge_token_stats(baseline: pd.DataFrame, intervention: pd.DataFrame) -> pd.
     return merged
 
 
+def summarize_prompt_deltas(merged: pd.DataFrame) -> pd.DataFrame:
+    prompt_delta = (
+        merged.groupby("prompt_index", as_index=False)
+        .agg(
+            delta_mean_logprob=("delta_logprob", "mean"),
+            delta_mean_entropy=("delta_entropy", "mean"),
+        )
+        .sort_values("prompt_index")
+    )
+    return prompt_delta
+
+
 def plot_token_delta_hist(df: pd.DataFrame, out_dir: Path, tag: str) -> None:
     if df.empty:
         return
@@ -73,10 +112,9 @@ def plot_token_delta_hist(df: pd.DataFrame, out_dir: Path, tag: str) -> None:
 def plot_prompt_bar(df: pd.DataFrame, out_dir: Path, tag: str) -> None:
     if df.empty:
         return
-    prompt_delta = df.groupby("prompt_index")["delta_logprob"].mean().reset_index()
-    prompt_delta = prompt_delta.sort_values("prompt_index")
+    prompt_delta = summarize_prompt_deltas(df)
     fig, ax = plt.subplots(figsize=(9, 4))
-    ax.bar(prompt_delta["prompt_index"], prompt_delta["delta_logprob"], width=0.8)
+    ax.bar(prompt_delta["prompt_index"], prompt_delta["delta_mean_logprob"], width=0.8)
     ax.set_title(f"Mean Δlogprob per prompt ({tag})")
     ax.set_xlabel("prompt index")
     ax.set_ylabel("mean Δlogprob")
@@ -137,25 +175,38 @@ def process_split(
     split: str,
     layers: Sequence[int] | None = None,
     excel_writer: pd.ExcelWriter | None = None,
-) -> None:
+) -> list[pd.DataFrame]:
     layer_list: list[int | None] = list(layers) if layers else [None]
+    merged_frames: list[pd.DataFrame] = []
+    seen_input_pairs: set[tuple[Path, Path]] = set()
     for layer in layer_list:
         suffix = f"_L{layer}" if layer is not None else ""
-        base_path = exp_dir / f"token_stats_baseline_{split}{suffix}.csv"
-        int_path = exp_dir / f"token_stats_intervention_{split}{suffix}.csv"
-        base_df = load_csv(base_path)
-        int_df = load_csv(int_path)
+        base_path = resolve_token_stats_path(exp_dir, "baseline", split, layer)
+        int_path = resolve_token_stats_path(exp_dir, "intervention", split, layer)
+        if base_path is None:
+            print(f"[warn] Missing token stats for baseline/{split}{suffix}")
+            continue
+        if int_path is None:
+            print(f"[warn] Missing token stats for intervention/{split}{suffix}")
+            continue
+        input_pair = (base_path, int_path)
+        if input_pair in seen_input_pairs:
+            continue
+        seen_input_pairs.add(input_pair)
+
+        base_df = load_table(base_path)
+        int_df = load_table(int_path)
         if base_df is None or int_df is None:
             continue
 
         merged = merge_token_stats(base_df, int_df)
-        merged_path = out_dir / f"token_stats_merged_{split}{suffix}.csv"
-        merged.to_csv(merged_path, index=False)
+        merged_frames.append(merged)
+        merged_path = out_dir / f"token_stats_merged_{split}{suffix}.parquet"
+        merged.to_parquet(merged_path, index=False)
 
         if excel_writer is not None:
             merged.to_excel(excel_writer, sheet_name=_safe_sheet_name(f"token_{split}{suffix}"), index=False)
-            prompt_delta = merged.groupby("prompt_index")["delta_logprob"].mean().reset_index()
-            prompt_delta = prompt_delta.sort_values("prompt_index")
+            prompt_delta = summarize_prompt_deltas(merged)
             prompt_delta.to_excel(
                 excel_writer,
                 sheet_name=_safe_sheet_name(f"prompt_delta_{split}{suffix}"),
@@ -167,28 +218,23 @@ def process_split(
         plot_prompt_bar(merged, out_dir, tag=tag)
         pred_cols = [c for c in base_df.columns if c.startswith("pred_")]
         plot_feature_pred_deltas(merged, out_dir, tag=tag, pred_cols=pred_cols)
+    return merged_frames
 
 
 def plot_logprob_summary(
-    exp_dir: Path, out_dir: Path, split: str, excel_writer: pd.ExcelWriter | None = None
+    merged: pd.DataFrame, out_dir: Path, split: str, excel_writer: pd.ExcelWriter | None = None
 ) -> None:
-    base_path = exp_dir / f"logprob_stats_baseline_{split}.csv"
-    int_path = exp_dir / f"logprob_stats_intervention_{split}.csv"
-    base_df = load_csv(base_path)
-    int_df = load_csv(int_path)
-    if base_df is None or int_df is None:
+    if merged.empty:
         return
 
-    merged = base_df.merge(int_df, on="prompt_index", suffixes=("_base", "_int"))
-    merged["delta_mean_logprob"] = merged["mean_logprob_int"] - merged["mean_logprob_base"]
-    merged["delta_mean_entropy"] = merged["mean_entropy_int"] - merged["mean_entropy_base"]
-    merged.to_csv(out_dir / f"logprob_stats_merged_{split}.csv", index=False)
+    prompt_delta = summarize_prompt_deltas(merged)
+    prompt_delta.to_parquet(out_dir / f"logprob_stats_merged_{split}.parquet", index=False)
 
     if excel_writer is not None:
-        merged.to_excel(excel_writer, sheet_name=_safe_sheet_name(f"logprob_{split}"), index=False)
+        prompt_delta.to_excel(excel_writer, sheet_name=_safe_sheet_name(f"logprob_{split}"), index=False)
 
     fig, ax = plt.subplots(figsize=(9, 4))
-    ax.bar(merged["prompt_index"], merged["delta_mean_logprob"], width=0.8)
+    ax.bar(prompt_delta["prompt_index"], prompt_delta["delta_mean_logprob"], width=0.8)
     ax.set_title(f"Δmean logprob per prompt ({split})")
     ax.set_xlabel("prompt index")
     ax.set_ylabel("Δmean logprob")
@@ -196,7 +242,7 @@ def plot_logprob_summary(
     save_plot(fig, out_dir / f"logprob_prompt_bar_{split}.png")
 
     fig, ax = plt.subplots(figsize=(7, 4))
-    merged["delta_mean_entropy"].hist(bins=50, ax=ax)
+    prompt_delta["delta_mean_entropy"].hist(bins=50, ax=ax)
     ax.set_title(f"Δmean entropy distribution ({split})")
     ax.set_xlabel("intervention - baseline")
     ax.set_ylabel("count")
@@ -206,7 +252,7 @@ def plot_logprob_summary(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Visualize probe intervention outputs (new format).")
-    parser.add_argument("--experiment-dir", required=True, help="Directory with token/logprob stats and gradient_cosines.csv")
+    parser.add_argument("--experiment-dir", required=True, help="Directory with token stats parquet/csv files and gradient_cosines.csv")
     parser.add_argument("--output-dir", default=None, help="Where to write plots/merged CSVs (default=experiment dir)")
     parser.add_argument(
         "--excel-out",
@@ -238,17 +284,18 @@ def main() -> None:
             print(f"[warn] Could not parse layers from metadata: {exc}")
 
     for split in ("new", "old"):
-        process_split(
+        merged_frames = process_split(
             exp_dir,
             out_dir,
             split,
             layers=layers if layers else None,
             excel_writer=excel_writer,
         )
-        plot_logprob_summary(exp_dir, out_dir, split, excel_writer=excel_writer)
+        if merged_frames:
+            plot_logprob_summary(pd.concat(merged_frames, ignore_index=True), out_dir, split, excel_writer=excel_writer)
 
     grad_path = exp_dir / "gradient_cosines.csv"
-    grad_df = load_csv(grad_path)
+    grad_df = load_table(grad_path)
     if grad_df is not None:
         plot_gradient_cosines(grad_df, out_dir)
 

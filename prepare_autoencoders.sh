@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+#SBATCH --nodes=1
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=180gb
+#SBATCH --partition=short
+#SBATCH --time=23:59:00
+#SBATCH --gres=gpu:a100:1
+#SBATCH --job-name=train_probes
+#SBATCH --array=0-207
 set -euo pipefail
 MODEL="EleutherAI/pythia-70m-deduped"
 DATA="data/LLM_mini.csv"
