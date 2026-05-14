@@ -7,6 +7,7 @@ CLI is intentionally similar to train_debiasing.py/torch for consistency.
 from __future__ import annotations
 
 import argparse
+import inspect
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,12 @@ from transformers import BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
 from scripts.prompt_utils import PROMPT_TEMPLATE, build_prompt_from_row
+from scripts.model_tuning_utils import (
+    freeze_except_transformer_layer,
+    freeze_peft_adapters_except_layer,
+    load_peft_adapter_if_requested,
+    trainable_parameter_summary,
+)
 
 from utils import (
     build_debias_metadata,
@@ -133,10 +140,11 @@ def augment_with_gender_swaps(df, args):
         swapped_text = f"{swapped_prompt}{args.prompt_response_sep}{response}".strip()
 
         gender_val = str(row.get(args.gender_column, "")).strip().lower() or None
-        swapped_gender_val = str(swapped_row.get(args.gender_column, "")).strip().lower() or None
 
         examples.append(DebiasExample(text=base_text, origin="original", gender=gender_val))
-        examples.append(DebiasExample(text=swapped_text, origin="swapped_prompt", gender=swapped_gender_val))
+        if args.swap_probability > 0 and random.random() <= args.swap_probability:
+            swapped_gender_val = str(swapped_row.get(args.gender_column, "")).strip().lower() or None
+            examples.append(DebiasExample(text=swapped_text, origin="swapped_prompt", gender=swapped_gender_val))
 
     if empty_rows:
         print(f"Skipped {empty_rows} empty/blank rows during augmentation.")
@@ -153,6 +161,14 @@ def split_examples(examples, eval_size: float, seed: int):
     return shuffled[:cut], shuffled[cut:]
 
 
+def make_sft_trainer(**kwargs):
+    signature = inspect.signature(SFTTrainer.__init__)
+    params = signature.parameters
+    if "tokenizer" not in params and "processing_class" in params and "tokenizer" in kwargs:
+        kwargs["processing_class"] = kwargs.pop("tokenizer")
+    return SFTTrainer(**kwargs)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Fine-tune with TRL SFTTrainer + optional LoRA/8bit.")
     parser.add_argument("--model-name", required=True)
@@ -164,6 +180,8 @@ def parse_args():
     parser.add_argument("--response-column", default="response")
     parser.add_argument("--gender-column", default="gender")
     parser.add_argument("--pronoun-column", default="pronoun")
+    parser.add_argument("--swap-probability", type=float, default=1.0)
+    parser.add_argument("--swap-response-text", action="store_true", help="Kept for metadata compatibility; TRL mode swaps prompts only.")
     parser.add_argument("--max-samples", type=int, default=None)
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--batch-size", type=int, default=2)
@@ -193,6 +211,8 @@ def parse_args():
     parser.add_argument("--load-in-8bit", action="store_true")
     parser.add_argument("--load-in-4bit", action="store_true")
     parser.add_argument("--no-peft", action="store_true", help="Force full-precision fine-tuning even if use-lora set.")
+    parser.add_argument("--train-layer", type=int, default=None, help="Freeze all model weights except this transformer layer. Use the probe layer here.")
+    parser.add_argument("--adapter-path", default=None, help="Optional PEFT adapter directory to load before training.")
     parser.add_argument("--save-augmented", action="store_true")
     return parser.parse_args()
 
@@ -233,7 +253,7 @@ def main():
         quantization_config = BitsAndBytesConfig(load_in_8bit=True)
 
     peft_config = None
-    if args.use_lora and not args.no_peft:
+    if args.use_lora and not args.no_peft and not args.adapter_path:
         peft_config = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -249,11 +269,21 @@ def main():
         quantization_config=quantization_config,
         torch_dtype=DTYPE_MAP[args.dtype],
     )
+    model = load_peft_adapter_if_requested(model, args.adapter_path, is_trainable=True)
     model.config.use_cache = False
+    peft_training = bool(args.adapter_path) or (args.use_lora and not args.no_peft)
+    if args.train_layer is not None and not peft_training:
+        resolved_layer = freeze_except_transformer_layer(model, args.train_layer)
+        summary = trainable_parameter_summary(model)
+        print(
+            f"[trainable] full-layer tuning layer={resolved_layer} "
+            f"params={summary['trainable']}/{summary['total']} ({summary['pct']:.4f}%)"
+        )
 
     version_dir = next_version_dir(
         kind="debiased",
         model_name=args.model_name,
+        layer=args.train_layer,
         base_dir=args.output_dir,
         version_override=args.version,
     )
@@ -281,7 +311,7 @@ def main():
         dataset_text_field="text",
     )
 
-    trainer = SFTTrainer(
+    trainer = make_sft_trainer(
         model=model,
         tokenizer=tokenizer,
         train_dataset=train_ds,
@@ -290,6 +320,13 @@ def main():
         data_collator=data_collator,
         peft_config=peft_config,
     )
+    if args.train_layer is not None and peft_training:
+        resolved_layer = freeze_peft_adapters_except_layer(trainer.model, args.train_layer)
+        summary = trainable_parameter_summary(trainer.model)
+        print(
+            f"[trainable] LoRA tuning layer={resolved_layer} "
+            f"params={summary['trainable']}/{summary['total']} ({summary['pct']:.4f}%)"
+        )
 
     print(f"[debug] train_samples={len(train_ds)} eval_samples={len(eval_ds) if eval_ds else 0}")
     trainer.train()

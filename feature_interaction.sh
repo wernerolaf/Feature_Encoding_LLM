@@ -66,10 +66,10 @@ LAYERS_OVERRIDE="${LAYERS_OVERRIDE:-4 8 12 16 20 24 28}"
 PRIMARY_STRENGTHS_OVERRIDE="${PRIMARY_STRENGTHS_OVERRIDE:-2.0 4.0 8.0}"
 
 MAX_SAMPLES="${MAX_SAMPLES:-all}"
-BATCH_SIZE="${BATCH_SIZE:-4}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
 GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-2}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-0.95}"
 SEED="${SEED:-0}"
@@ -82,6 +82,11 @@ STRENGTH_UNIT="${STRENGTH_UNIT:-activation_pct}"
 COLLECT_PROBE_LAYERS="${COLLECT_PROBE_LAYERS:-all}"
 LOGPROB_CHUNK_SIZE="${LOGPROB_CHUNK_SIZE:-16}"
 PROGRESS_STYLE="${PROGRESS_STYLE:-line}"
+NO_GRADIENT_COSINES="${NO_GRADIENT_COSINES:-1}"
+ACTIVATION_COSINE_COMPARISON="${ACTIVATION_COSINE_COMPARISON:-0}"
+ACTIVATION_COSINE_LAYERS="${ACTIVATION_COSINE_LAYERS:-}"
+ADAPTER_PATH="${ADAPTER_PATH:-}"
+ADAPTER_PATH_TEMPLATE="${ADAPTER_PATH_TEMPLATE:-}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -116,10 +121,28 @@ slugify() {
   printf '%s' "$raw"
 }
 
+expand_layer_path() {
+  local raw="$1"
+  local layer_value="$2"
+  local placeholder="{layer}"
+  local broken_placeholder="{layer"
+  raw="${raw//$placeholder/$layer_value}"
+  raw="${raw//$broken_placeholder/$layer_value}"
+  raw="$(printf '%s' "$raw" | tr -d '{}')"
+  printf '%s' "$raw"
+}
+
 run_job() {
   local layer="$1"
   local primary_strength="$2"
   local primary_mode="$3"
+  local adapter_for_layer="$ADAPTER_PATH"
+
+  if [ -z "$adapter_for_layer" ] && [ -n "$ADAPTER_PATH_TEMPLATE" ]; then
+    adapter_for_layer="$(expand_layer_path "$ADAPTER_PATH_TEMPLATE" "$layer")"
+  elif [ -n "$adapter_for_layer" ]; then
+    adapter_for_layer="$(expand_layer_path "$adapter_for_layer" "$layer")"
+  fi
 
   local exp_name
   exp_name="$(
@@ -154,6 +177,28 @@ run_job() {
     --output-dir "$OUTPUT_ROOT"
     --experiment-name "$exp_name"
   )
+
+  if [ "$NO_GRADIENT_COSINES" = "1" ]; then
+    cmd+=(--no-gradient-cosines)
+  fi
+
+  if [ "$ACTIVATION_COSINE_COMPARISON" = "1" ]; then
+    cmd+=(--activation-cosine-comparison)
+  fi
+
+  if [ -n "$ACTIVATION_COSINE_LAYERS" ]; then
+    cmd+=(--activation-cosine-layers "$ACTIVATION_COSINE_LAYERS")
+  elif [ "$ACTIVATION_COSINE_COMPARISON" = "1" ] || [ -n "$adapter_for_layer" ]; then
+    cmd+=(--activation-cosine-layers "$layer")
+  fi
+
+  if [ -n "$adapter_for_layer" ]; then
+    if [ ! -f "${adapter_for_layer}/adapter_config.json" ]; then
+      echo "[feature_interaction] Missing adapter_config.json under adapter path: ${adapter_for_layer}" >&2
+      exit 1
+    fi
+    cmd+=(--adapter-path "$adapter_for_layer")
+  fi
 
   if [ -n "$MAX_SAMPLES" ] && [ "$MAX_SAMPLES" != "all" ]; then
     cmd+=(--max-samples "$MAX_SAMPLES")

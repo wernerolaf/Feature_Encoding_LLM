@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=180gb
 #SBATCH --partition=short
 #SBATCH --time=23:59:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --job-name=train_probes
-#SBATCH --array=0-48
+#SBATCH --array=0-207
 
 set -euo pipefail
 
@@ -58,7 +58,7 @@ VAL_SIZE="${VAL_SIZE:-0.1}"
 TEST_SIZE="${TEST_SIZE:-0.2}"
 RANDOM_STATE="${RANDOM_STATE:-0}"
 LABEL_CHUNK_SIZE="${LABEL_CHUNK_SIZE:-0}"
-LAYER_CHUNK_SIZE="${LAYER_CHUNK_SIZE:-8}"
+LAYER_CHUNK_SIZE="${LAYER_CHUNK_SIZE:-2}"
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:-}"
 VERSION="${VERSION_OVERRIDE:-${TASK_ID:-}}"

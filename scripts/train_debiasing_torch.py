@@ -22,6 +22,11 @@ from transformers import (
 )
 
 from scripts.prompt_utils import PROMPT_TEMPLATE, build_text_from_row
+from scripts.model_tuning_utils import (
+    freeze_except_transformer_layer,
+    load_peft_adapter_if_requested,
+    trainable_parameter_summary,
+)
 from utils import (
     build_debias_metadata,
     load_table,
@@ -211,6 +216,8 @@ def parse_args():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=tuple(DTYPE_MAP), default="float32")
+    parser.add_argument("--train-layer", type=int, default=None, help="Freeze all model weights except this transformer layer. Use the probe layer here.")
+    parser.add_argument("--adapter-path", default=None, help="Optional PEFT adapter directory to load before training.")
     parser.add_argument("--save-augmented", action="store_true")
     parser.add_argument("--prompt-response-sep", default="\n")
     return parser.parse_args()
@@ -232,6 +239,15 @@ def main():
         args.model_name,
         dtype=param_dtype,
     ).to(device)
+    model = load_peft_adapter_if_requested(model, args.adapter_path, is_trainable=True)
+    model.to(device)
+    if args.train_layer is not None:
+        resolved_layer = freeze_except_transformer_layer(model, args.train_layer)
+        summary = trainable_parameter_summary(model)
+        print(
+            f"[trainable] full-layer tuning layer={resolved_layer} "
+            f"params={summary['trainable']}/{summary['total']} ({summary['pct']:.4f}%)"
+        )
 
     df = load_table(args.data_path, sheet=args.sheet)
     data_hash = sha256_file(args.data_path)
@@ -263,7 +279,7 @@ def main():
             collate_fn=data_collator,
         )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=args.learning_rate, weight_decay=args.weight_decay)
     total_steps = args.epochs * (len(train_loader))
     scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=args.warmup_steps, num_training_steps=total_steps)
 
@@ -343,6 +359,7 @@ def main():
     version_dir = next_version_dir(
         kind="debiased",
         model_name=args.model_name,
+        layer=args.train_layer,
         base_dir=args.output_dir,
         version_override=args.version,
     )

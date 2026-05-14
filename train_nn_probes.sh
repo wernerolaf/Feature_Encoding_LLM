@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=16
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=180gb
 #SBATCH --partition=short
 #SBATCH --time=23:59:00
@@ -53,7 +53,7 @@ VAL_SIZE="${VAL_SIZE:-0.1}"
 TEST_SIZE="${TEST_SIZE:-0.2}"
 RANDOM_STATE="${RANDOM_STATE:-0}"
 LABEL_CHUNK_SIZE="${LABEL_CHUNK_SIZE:-0}"
-LAYER_CHUNK_SIZE="${LAYER_CHUNK_SIZE:-8}"
+LAYER_CHUNK_SIZE="${LAYER_CHUNK_SIZE:-2}"
 
 NN_HIDDEN_DIM="${NN_HIDDEN_DIM:-128}"
 NN_DROPOUT="${NN_DROPOUT:-0.0}"

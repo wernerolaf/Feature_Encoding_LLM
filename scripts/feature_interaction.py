@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import nullcontext
 import csv
 import json
 import re
@@ -24,6 +25,7 @@ except Exception:  # pragma: no cover - fallback for minimal environments
 from activation_standardizer import ActivationStandardizer
 from probes import DecisionTreeProbe, LinearProbe, ShallowNNProbe
 from scripts.prompt_utils import PROMPT_TEMPLATE, build_prompt_series, build_text_series
+from scripts.model_tuning_utils import load_peft_adapter_if_requested
 from utils import (
     artifact_version_dir,
     load_table,
@@ -118,40 +120,7 @@ class FeatureProbeContext:
     task: str
     strength_unit: StrengthUnit = "raw"
     intervene: bool = True
-    analytics: list[dict[str, object]] = field(default_factory=list)
     training_metrics: dict[str, float] = field(default_factory=dict)
-
-    def log(self, step: int, probabilities: np.ndarray, *, tag: str) -> None:
-        summary: dict[str, dict[str, float]] = {}
-        if probabilities.ndim == 1 or probabilities.shape[1] == 1:
-            col = probabilities.reshape(-1)
-            key = self.class_names[0] if self.class_names else "value"
-            summary[key] = {
-                "mean": float(col.mean()),
-                "std": float(col.std()),
-                "min": float(col.min()),
-                "max": float(col.max()),
-            }
-        else:
-            for idx, class_name in enumerate(self.class_names):
-                col = probabilities[:, idx]
-                summary[str(class_name)] = {
-                    "mean": float(col.mean()),
-                    "std": float(col.std()),
-                    "min": float(col.min()),
-                    "max": float(col.max()),
-                }
-        self.analytics.append(
-            {
-                "step": step,
-                "mode": self.mode,
-                "strength": self.strength,
-                "strength_unit": self.strength_unit,
-                "intervene": self.intervene,
-                "tokens_observed": int(probabilities.shape[0]),
-                "class_stats": {tag: summary},
-            }
-        )
 
 
 def parse_feature_specs(raw_specs: Sequence[str]) -> list[FeatureSpec]:
@@ -297,12 +266,35 @@ def load_probe_artifact(
     )
 
 
+def adapter_disabled_context(model: AutoModelForCausalLM):
+    disable_adapter = getattr(model, "disable_adapter", None)
+    if callable(disable_adapter):
+        return disable_adapter()
+    return nullcontext()
+
+
 def resolve_layer_module(model: AutoModelForCausalLM, layer_idx: int):
     candidates: list[Iterable[torch.nn.Module]] = []
-    for root_name in ("transformer", "model", "encoder", "decoder", "gpt_neox", "backbone"):
-        root = getattr(model, root_name, None)
+    roots = [model, getattr(model, "base_model", None)]
+    base = getattr(model, "base_model", None)
+    if base is not None:
+        roots.append(getattr(base, "model", None))
+
+    for root_obj in list(roots):
+        if root_obj is not None:
+            roots.extend(
+                getattr(root_obj, name, None)
+                for name in ("transformer", "model", "encoder", "decoder", "gpt_neox", "backbone")
+            )
+
+    seen: set[int] = set()
+    for root in roots:
         if root is None:
             continue
+        root_id = id(root)
+        if root_id in seen:
+            continue
+        seen.add(root_id)
         for stack_name in ("h", "layers", "block"):
             stack = getattr(root, stack_name, None)
             if stack is not None:
@@ -383,25 +375,6 @@ class ProbeInterventionHook:
             with torch.enable_grad():
                 raw_gradients = ctx.probe.get_gradient(flat_np, normalize=False)
 
-            grad_source = "gradient"
-            raw_norms = np.linalg.norm(raw_gradients, axis=1)
-            ctx.analytics.append(
-                {
-                    "step": self.step,
-                    "mode": ctx.mode,
-                    "strength": ctx.strength,
-                    "strength_unit": ctx.strength_unit,
-                    "intervene": ctx.intervene,
-                    "tag": "gradient_norm",
-                    "source": grad_source,
-                    "tokens_observed": int(raw_norms.shape[0]),
-                    "grad_norm_mean": float(np.mean(raw_norms)),
-                    "grad_norm_std": float(np.std(raw_norms)),
-                    "grad_norm_min": float(np.min(raw_norms)),
-                    "grad_norm_max": float(np.max(raw_norms)),
-                }
-            )
-
             grad_tensor = torch.from_numpy(raw_gradients).to(flat.device)
             grad_norm = grad_tensor.norm(dim=-1, keepdim=True).clamp_min(1e-12)
             grad_unit = grad_tensor / grad_norm
@@ -426,28 +399,7 @@ class ProbeInterventionHook:
                     adjustment = -ctx.strength * projection * grad_tensor
                 total_adjustment += adjustment
 
-            # pre-adjustment stats
-            try:
-                pre_scores = ctx.probe.predict_proba(flat_np)
-            except Exception:
-                pre_scores = ctx.probe.predict(flat_np)
-            pre_arr = np.asarray(pre_scores)
-            if pre_arr.ndim == 1:
-                pre_arr = pre_arr.reshape(-1, 1)
-            ctx.log(self.step, pre_arr, tag="pre")
-
         flat = flat + total_adjustment
-        # post-adjustment stats
-        for ctx in self.contexts:
-            adjusted_np = tensor_to_numpy_float(flat)
-            try:
-                post_scores = ctx.probe.predict_proba(adjusted_np)
-            except Exception:
-                post_scores = ctx.probe.predict(adjusted_np)
-            post_arr = np.asarray(post_scores)
-            if post_arr.ndim == 1:
-                post_arr = post_arr.reshape(-1, 1)
-            ctx.log(self.step, post_arr, tag="post" if self.active else "neutral")
 
         hidden = flat.reshape(batch, seq_len, hidden_dim)
         self.step += 1
@@ -461,6 +413,17 @@ class ProbeInterventionHook:
         if isinstance(outputs, tuple):
             return outputs[0], "tuple"
         return outputs, "tensor"
+
+
+class ActivationCaptureHook:
+    def __init__(self, captured: dict[int, torch.Tensor], *, layer_idx: int) -> None:
+        self.captured = captured
+        self.layer_idx = layer_idx
+
+    def __call__(self, module, inputs, outputs):
+        hidden, _ = ProbeInterventionHook._extract_hidden(outputs)
+        self.captured[self.layer_idx] = hidden.detach()
+        return None
 
 
 def read_prompts(path: Path) -> list[str]:
@@ -588,6 +551,8 @@ def run_generation(
             generated_ids = None
             hidden_states = None
             layer_states = None
+            flat_t = None
+            flat_np = None
             enc_for_hidden = None
             try:
                 enc = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
@@ -637,25 +602,31 @@ def run_generation(
                                 raise IndexError(f"Requested layer index {layer_idx} maps to hidden_states[{idx}] out of range 0..{total_layers-1}")
                             layer_states = hidden_states[idx][:, :seq_len, :]
                             valid_mask = attention_mask.bool()
-                            flat = tensor_to_numpy_float(layer_states[valid_mask])
-                            cos_records.extend(compute_gradient_cosines(ctxs, flat, layer=layer_idx))
+                            flat_t = layer_states[valid_mask]
+                            flat_np = None if args.no_gradient_cosines else tensor_to_numpy_float(flat_t)
+                            if flat_np is not None:
+                                cos_records.extend(compute_gradient_cosines(ctxs, flat_np, layer=layer_idx))
 
                             # per-token probe predictions
                             batch_size_cur = layer_states.size(0)
                             seq_len_cur = layer_states.size(1)
                             for ctx in ctxs:
-                                try:
-                                    preds = ctx.probe.predict_proba(flat)
-                                    if preds.ndim == 2 and preds.shape[1] > 1:
-                                        preds_scalar = preds[:, 1]  # prob of class 1
-                                    else:
-                                        preds_scalar = preds.reshape(-1)
-                                except Exception:
+                                preds_scalar = torch_linear_probe_predict_scalar(ctx, flat_t)
+                                if preds_scalar is None:
+                                    if flat_np is None:
+                                        flat_np = tensor_to_numpy_float(flat_t)
                                     try:
-                                        preds = ctx.probe.predict(flat)
-                                        preds_scalar = np.asarray(preds).reshape(-1)
+                                        preds = ctx.probe.predict_proba(flat_np)
+                                        if preds.ndim == 2 and preds.shape[1] > 1:
+                                            preds_scalar = preds[:, 1]  # prob of class 1
+                                        else:
+                                            preds_scalar = preds.reshape(-1)
                                     except Exception:
-                                        preds_scalar = np.full(flat.shape[0], np.nan)
+                                        try:
+                                            preds = ctx.probe.predict(flat_np)
+                                            preds_scalar = np.asarray(preds).reshape(-1)
+                                        except Exception:
+                                            preds_scalar = np.full(flat_np.shape[0], np.nan)
 
                                 filled = np.full((batch_size_cur, seq_len_cur), np.nan, dtype=float)
                                 flat_idx = 0
@@ -679,7 +650,7 @@ def run_generation(
                                     entry[pred_key] = filled[bi].tolist()
 
             finally:
-                del outputs, sequences, generated_ids, hidden_states, layer_states, enc_for_hidden, enc
+                del outputs, sequences, generated_ids, hidden_states, layer_states, flat_t, flat_np, enc_for_hidden, enc
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
@@ -721,6 +692,206 @@ def run_generation(
     finally:
         for h in hooks:
             h.remove()
+
+
+def hidden_states_for_batch(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    prompts: list[str],
+    *,
+    layers: list[int],
+    contexts_by_layer: dict[int, list[FeatureProbeContext]],
+    device: torch.device,
+    max_length: int,
+    hook_active: bool,
+    disable_adapter: bool,
+) -> tuple[dict[int, torch.Tensor], torch.Tensor]:
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
+    captured: dict[int, torch.Tensor] = {}
+    hook_layers = sorted(set(layers) | (set(contexts_by_layer) if hook_active else set()))
+    for layer_idx in hook_layers:
+        module = resolve_layer_module(model, layer_idx)
+        if hook_active and layer_idx in contexts_by_layer:
+            ctxs = contexts_by_layer[layer_idx]
+            hook_contexts = [ctx for ctx in ctxs if ctx.intervene]
+            if hook_contexts:
+                intervention_hook = ProbeInterventionHook(hook_contexts, layer_idx=layer_idx, output_dir=Path("."))
+                intervention_hook.active = True
+                hooks.append(module.register_forward_hook(intervention_hook))
+        if layer_idx in layers:
+            hooks.append(module.register_forward_hook(ActivationCaptureHook(captured, layer_idx=layer_idx)))
+
+    ctx = adapter_disabled_context(model) if disable_adapter else nullcontext()
+    try:
+        tokenizer.padding_side = "left"
+        enc = tokenizer(
+            prompts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+        ).to(device)
+        with ctx:
+            with torch.no_grad():
+                model(**enc)
+        attention_mask = enc["attention_mask"]
+        missing = [layer_idx for layer_idx in layers if layer_idx not in captured]
+        if missing:
+            raise RuntimeError(f"Did not capture activation outputs for layers {missing}.")
+        seq_len = min([attention_mask.shape[1]] + [captured[layer_idx].shape[1] for layer_idx in layers])
+        attention_mask = attention_mask[:, :seq_len].bool()
+        selected: dict[int, torch.Tensor] = {}
+        for layer_idx in layers:
+            selected[layer_idx] = captured[layer_idx][:, :seq_len, :].detach()
+        return selected, attention_mask
+    finally:
+        for h in hooks:
+            h.remove()
+
+
+def summarize_cosine_values(values_list: list[np.ndarray]) -> dict[str, float | int]:
+    if not values_list:
+        return {"tokens": 0, "mean": float("nan"), "std": float("nan"), "min": float("nan"), "max": float("nan")}
+    values = np.concatenate(values_list)
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return {"tokens": 0, "mean": float("nan"), "std": float("nan"), "min": float("nan"), "max": float("nan")}
+    return {
+        "tokens": int(finite.size),
+        "mean": float(np.mean(finite)),
+        "std": float(np.std(finite)),
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+    }
+
+
+def save_activation_cosine_comparison(
+    output_dir: Path,
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    *,
+    prompts: list[str],
+    layers: list[int],
+    contexts_by_layer: dict[int, list[FeatureProbeContext]],
+    device: torch.device,
+    args: argparse.Namespace,
+) -> None:
+    if not layers:
+        print("[activation_cosine] no layers requested; skipping.")
+        return
+
+    batch_size = max(1, args.generation_batch_size)
+    pair_similarities: dict[tuple[str, int, int], list[np.ndarray]] = {}
+    has_adapter = bool(args.adapter_path)
+    batch_starts = range(0, len(prompts), batch_size)
+    print(f"[activation_cosine] prompts={len(prompts)} layers={layers} adapter={has_adapter}", flush=True)
+
+    for start in batch_starts:
+        batch_prompts = prompts[start : start + batch_size]
+        original, valid_mask = hidden_states_for_batch(
+            model,
+            tokenizer,
+            batch_prompts,
+            layers=layers,
+            contexts_by_layer=contexts_by_layer,
+            device=device,
+            max_length=args.max_length,
+            hook_active=False,
+            disable_adapter=has_adapter,
+        )
+        intervention, intervention_mask = hidden_states_for_batch(
+            model,
+            tokenizer,
+            batch_prompts,
+            layers=layers,
+            contexts_by_layer=contexts_by_layer,
+            device=device,
+            max_length=args.max_length,
+            hook_active=True,
+            disable_adapter=has_adapter,
+        )
+        if not torch.equal(valid_mask, intervention_mask):
+            raise ValueError("Original and intervention attention masks differ; cannot compare activations.")
+
+        adapter = None
+        adapter_mask = None
+        if has_adapter:
+            adapter, adapter_mask = hidden_states_for_batch(
+                model,
+                tokenizer,
+                batch_prompts,
+                layers=layers,
+                contexts_by_layer=contexts_by_layer,
+                device=device,
+                max_length=args.max_length,
+                hook_active=False,
+                disable_adapter=False,
+            )
+            if not torch.equal(valid_mask, adapter_mask):
+                raise ValueError("Original and adapter attention masks differ; cannot compare activations.")
+
+        for layer_idx in layers:
+            for batch_idx in range(valid_mask.shape[0]):
+                prompt_idx = start + batch_idx
+                mask = valid_mask[batch_idx]
+                original_prompt = original[layer_idx][batch_idx, mask].float()
+                intervention_prompt = intervention[layer_idx][batch_idx, mask].float()
+                sim = torch.nn.functional.cosine_similarity(original_prompt, intervention_prompt, dim=-1)
+                sim_np = sim.detach().float().cpu().numpy()
+                pair_similarities.setdefault(("original_vs_intervention", layer_idx, prompt_idx), []).append(sim_np)
+
+                if adapter is not None:
+                    adapter_prompt = adapter[layer_idx][batch_idx, mask].float()
+                    sim = torch.nn.functional.cosine_similarity(original_prompt, adapter_prompt, dim=-1)
+                    sim_np = sim.detach().float().cpu().numpy()
+                    pair_similarities.setdefault(("original_vs_adapter", layer_idx, prompt_idx), []).append(sim_np)
+
+        del original, intervention, adapter
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    path = output_dir / "activation_cosine_distances.csv"
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(
+            f,
+            fieldnames=[
+                "prompt_index",
+                "pair",
+                "layer",
+                "tokens",
+                "cosine_similarity_mean",
+                "cosine_similarity_std",
+                "cosine_similarity_min",
+                "cosine_similarity_max",
+                "cosine_distance_mean",
+                "cosine_distance_std",
+                "cosine_distance_min",
+                "cosine_distance_max",
+            ],
+        )
+        writer.writeheader()
+        for (pair, layer_idx, prompt_idx), chunks in sorted(pair_similarities.items(), key=lambda item: (item[0][2], item[0][0], item[0][1])):
+            sim_stats = summarize_cosine_values(chunks)
+            dist_chunks = [1.0 - chunk for chunk in chunks]
+            dist_stats = summarize_cosine_values(dist_chunks)
+            writer.writerow(
+                {
+                    "prompt_index": prompt_idx,
+                    "pair": pair,
+                    "layer": layer_idx,
+                    "tokens": sim_stats["tokens"],
+                    "cosine_similarity_mean": sim_stats["mean"],
+                    "cosine_similarity_std": sim_stats["std"],
+                    "cosine_similarity_min": sim_stats["min"],
+                    "cosine_similarity_max": sim_stats["max"],
+                    "cosine_distance_mean": dist_stats["mean"],
+                    "cosine_distance_std": dist_stats["std"],
+                    "cosine_distance_min": dist_stats["min"],
+                    "cosine_distance_max": dist_stats["max"],
+                }
+            )
+    print(f"[activation_cosine] saved {path}", flush=True)
 
 
 def save_token_stats(
@@ -949,6 +1120,65 @@ def compute_gradient_cosines(
     return records
 
 
+def torch_linear_probe_predict_scalar(ctx: FeatureProbeContext, flat_t: torch.Tensor) -> np.ndarray | None:
+    if not isinstance(ctx.probe, LinearProbe):
+        return None
+
+    standardizer = getattr(ctx.probe, "standardizer", None)
+    strategy = getattr(standardizer, "strategy", "identity")
+    if strategy not in {"identity", "standard"}:
+        return None
+
+    sklearn_model = getattr(ctx.probe, "model", None)
+    coef_np = getattr(sklearn_model, "coef_", None)
+    if coef_np is None:
+        return None
+    intercept_np = getattr(sklearn_model, "intercept_", 0.0)
+
+    cache_key = (flat_t.device.type, flat_t.device.index, str(flat_t.dtype))
+    cache = getattr(ctx, "_torch_linear_cache", {})
+    cached = cache.get(cache_key)
+    if cached is None:
+        coef = torch.as_tensor(np.asarray(coef_np), device=flat_t.device, dtype=torch.float32)
+        intercept = torch.as_tensor(np.asarray(intercept_np), device=flat_t.device, dtype=torch.float32).reshape(-1)
+        mean = None
+        scale = None
+        if strategy == "standard":
+            scaler = getattr(standardizer, "_scaler", None)
+            if scaler is None:
+                return None
+            mean_np = getattr(scaler, "mean_", None)
+            scale_np = getattr(scaler, "scale_", None)
+            if mean_np is not None:
+                mean = torch.as_tensor(np.asarray(mean_np), device=flat_t.device, dtype=torch.float32)
+            if scale_np is not None:
+                scale_arr = np.asarray(scale_np)
+                scale_arr = np.where(scale_arr == 0, 1.0, scale_arr)
+                scale = torch.as_tensor(scale_arr, device=flat_t.device, dtype=torch.float32)
+        cached = (coef, intercept, mean, scale)
+        cache[cache_key] = cached
+        setattr(ctx, "_torch_linear_cache", cache)
+
+    coef, intercept, mean, scale = cached
+    x = flat_t.float()
+    if mean is not None:
+        x = x - mean
+    if scale is not None:
+        x = x / scale
+
+    logits = x @ coef.T
+    logits = logits + intercept
+
+    if ctx.task == "regression":
+        preds = logits.reshape(-1)
+    elif logits.shape[1] == 1:
+        preds = torch.sigmoid(logits[:, 0])
+    else:
+        preds = torch.softmax(logits, dim=-1)[:, 1]
+
+    return preds.detach().float().cpu().numpy()
+
+
 def save_gradient_cosines(
     output_dir: Path,
     records: list[dict[str, object]],
@@ -973,27 +1203,6 @@ def save_gradient_cosines(
                     error if error else "",
                 ]
             )
-
-
-def save_probe_analytics(output_dir: Path, contexts: list[FeatureProbeContext]) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    payload = []
-    for ctx in contexts:
-        payload.append(
-            {
-                "feature": ctx.name,
-                "layer": ctx.layer,
-                "mode": ctx.mode,
-                "strength": ctx.strength,
-                "strength_unit": ctx.strength_unit,
-                "intervene": ctx.intervene,
-                "task": ctx.task,
-                "class_names": ctx.class_names,
-                "training_metrics": ctx.training_metrics,
-                "analytics": ctx.analytics,
-            }
-        )
-    save_json({"contexts": payload}, output_dir / "probe_analytics.json")
 
 
 def save_metadata(
@@ -1089,6 +1298,14 @@ def parse_args() -> argparse.Namespace:
                         help="Include decoded token text in token-level outputs (larger files).")
     parser.add_argument("--token-stats-skip-special", action="store_true",
                         help="Skip special tokens when exporting token-level stats.")
+    parser.add_argument("--no-gradient-cosines", action="store_true",
+                        help="Skip gradient cosine computation and do not write gradient_cosines.csv.")
+    parser.add_argument("--adapter-path", default=None,
+                        help="Optional PEFT adapter directory used for activation cosine comparison.")
+    parser.add_argument("--activation-cosine-comparison", action="store_true",
+                        help="Write activation_cosine_distances.csv comparing original, adapter, and intervention activations.")
+    parser.add_argument("--activation-cosine-layers", default=None,
+                        help="Layers for activation cosine comparison. Defaults to the experiment layers. Use 'all', '0,4,8', or ranges like '0-31'.")
     parser.add_argument("--progress-style", choices=["line", "tqdm", "none"], default="line",
                         help="Progress reporting style. 'line' is Slurm-friendly; 'tqdm' is better for interactive terminals.")
     parser.add_argument("--no-progress", action="store_true",
@@ -1390,9 +1607,30 @@ def main() -> None:
         tag="baseline_new",
     )
 
+    if args.activation_cosine_comparison or args.adapter_path:
+        comparison_layers = (
+            parse_layer_selection(args.activation_cosine_layers, model=model)
+            if args.activation_cosine_layers
+            else sorted(layers)
+        )
+        if args.adapter_path:
+            print(f"[activation_cosine] loading adapter {args.adapter_path}", flush=True)
+            model = load_peft_adapter_if_requested(model, args.adapter_path, is_trainable=False)
+            model.to(device)
+            model.eval()
+        save_activation_cosine_comparison(
+            out_dir,
+            model,
+            tokenizer,
+            prompts=full_texts,
+            layers=comparison_layers,
+            contexts_by_layer=contexts_by_layer,
+            device=device,
+            args=args,
+        )
+
     all_cos = cos_records + neutral_cos + active_cos + baseline_cos
     save_gradient_cosines(out_dir, all_cos)
-    save_probe_analytics(out_dir, all_contexts)
 
     save_metadata(out_dir, args, feature_specs, sorted(layers), data_hash=data_hash)
 
