@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 #SBATCH --nodes=1
-#SBATCH --cpus-per-task=24
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=180gb
 #SBATCH --partition=short
 #SBATCH --time=23:59:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --job-name=feature_interaction
-#SBATCH --array=0-62%8
+#SBATCH --array=0-47%8
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -52,24 +52,43 @@ fi
 MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}"
 DATA="${DATA:-data/LLM_mini.csv}"
 PROBE_DIR="${PROBE_DIR:-artifacts/probes}"
-PROBE_VERSION="${PROBE_VERSION:-latest}"
+PROBE_STANDARDIZER="${PROBE_STANDARDIZER:-identity}"  # identity | raw | standard | autoencoder | any
+if [ -z "${PROBE_VERSION+x}" ]; then
+  case "$PROBE_STANDARDIZER" in
+    raw|identity|no_autoencoder|no-ae)
+      PROBE_VERSION="latest_raw"
+      ;;
+    autoencoder|ae|sae)
+      PROBE_VERSION="latest_autoencoder"
+      ;;
+    any|latest)
+      PROBE_VERSION="latest"
+      ;;
+    *)
+      echo "[feature_interaction] Unknown PROBE_STANDARDIZER='${PROBE_STANDARDIZER}'. Use raw, autoencoder, or any." >&2
+      exit 1
+      ;;
+  esac
+fi
 PRIMARY_PROBE_VERSION="${PRIMARY_PROBE_VERSION:-$PROBE_VERSION}"
 SECONDARY_PROBE_VERSION="${SECONDARY_PROBE_VERSION:-$PROBE_VERSION}"
-OUTPUT_ROOT="${OUTPUT_ROOT:-artifacts/experiments/feature_interaction}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-artifacts/experiments/adapter_probe_comparison}"
 MODEL_FILTER_VALUE="${MODEL_FILTER_VALUE:-Meta-Llama-3-8B}"
 
 PRIMARY_FEATURE="${PRIMARY_FEATURE:-gender}"
 COLLECT_FEATURES_OVERRIDE="${COLLECT_FEATURES_OVERRIDE:-i we female shehe clout polite prosocial risk differ negate}"
 PRIMARY_MODES_OVERRIDE="${PRIMARY_MODES_OVERRIDE:-increase decrease project}"
 
-LAYERS_OVERRIDE="${LAYERS_OVERRIDE:-4 8 12 16 20 24 28}"
-PRIMARY_STRENGTHS_OVERRIDE="${PRIMARY_STRENGTHS_OVERRIDE:-2.0 4.0 8.0}"
+LAYERS_OVERRIDE="${LAYERS_OVERRIDE:-8 12 16 20 24 28}"
+PRIMARY_STRENGTHS_OVERRIDE="${PRIMARY_STRENGTHS_OVERRIDE:-4.0 8.0 16.0}"
+PROJECT_STRENGTHS_OVERRIDE="${PROJECT_STRENGTHS_OVERRIDE:-50.0 100.0}"
 
 MAX_SAMPLES="${MAX_SAMPLES:-all}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
-GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-2}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
+GENERATION_BATCH_SIZE="${GENERATION_BATCH_SIZE:-8}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
-MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-1024}"
+MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-512}"
+ADAPTER_MIN_NEW_TOKENS="${ADAPTER_MIN_NEW_TOKENS:-32}"
 TEMPERATURE="${TEMPERATURE:-0.0}"
 TOP_P="${TOP_P:-0.95}"
 SEED="${SEED:-0}"
@@ -77,16 +96,24 @@ DEVICE="${DEVICE:-auto}"
 DTYPE="${DTYPE:-bfloat16}"
 PROBE_TYPE="${PROBE_TYPE:-linear}"
 TOKEN_STATS_FORMAT="${TOKEN_STATS_FORMAT:-parquet}"
+TOKEN_STATS_INCLUDE_TEXT="${TOKEN_STATS_INCLUDE_TEXT:-1}"
+TOKEN_STATS_SKIP_SPECIAL="${TOKEN_STATS_SKIP_SPECIAL:-1}"
+SKIP_NEW_PROBE_STATS="${SKIP_NEW_PROBE_STATS:-0}"
+SKIP_BASELINE_NEW_GENERATION="${SKIP_BASELINE_NEW_GENERATION:-1}"
 DO_SAMPLE="${DO_SAMPLE:-0}"
 STRENGTH_UNIT="${STRENGTH_UNIT:-activation_pct}"
 COLLECT_PROBE_LAYERS="${COLLECT_PROBE_LAYERS:-all}"
 LOGPROB_CHUNK_SIZE="${LOGPROB_CHUNK_SIZE:-16}"
 PROGRESS_STYLE="${PROGRESS_STYLE:-line}"
 NO_GRADIENT_COSINES="${NO_GRADIENT_COSINES:-1}"
-ACTIVATION_COSINE_COMPARISON="${ACTIVATION_COSINE_COMPARISON:-0}"
-ACTIVATION_COSINE_LAYERS="${ACTIVATION_COSINE_LAYERS:-}"
+ACTIVATION_COSINE_COMPARISON="${ACTIVATION_COSINE_COMPARISON:-1}"
+ACTIVATION_COSINE_LAYERS="${ACTIVATION_COSINE_LAYERS:-all}"
+ACTIVATION_COSINE_BATCH_SIZE="${ACTIVATION_COSINE_BATCH_SIZE:-2}"
 ADAPTER_PATH="${ADAPTER_PATH:-}"
-ADAPTER_PATH_TEMPLATE="${ADAPTER_PATH_TEMPLATE:-}"
+ADAPTER_FIRST_COMBINATION_ONLY="${ADAPTER_FIRST_COMBINATION_ONLY:-1}"
+ADAPTER_MODEL_SLUG="${ADAPTER_MODEL_SLUG:-meta-llama_Meta-Llama-3-8B-Instruct}"
+ADAPTER_VERSION="${ADAPTER_VERSION:-1}"
+ADAPTER_PATH_TEMPLATE="${ADAPTER_PATH_TEMPLATE:-artifacts/debias/layer_adapters/debiased/${ADAPTER_MODEL_SLUG}/layer{layer}/ver_${ADAPTER_VERSION}/${ADAPTER_MODEL_SLUG}}"
 export PYTORCH_ALLOC_CONF="${PYTORCH_ALLOC_CONF:-expandable_segments:True}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
@@ -94,6 +121,7 @@ read -r -a LAYERS <<< "$LAYERS_OVERRIDE"
 read -r -a COLLECT_FEATURES <<< "$COLLECT_FEATURES_OVERRIDE"
 read -r -a PRIMARY_MODES <<< "$PRIMARY_MODES_OVERRIDE"
 read -r -a PRIMARY_STRENGTHS <<< "$PRIMARY_STRENGTHS_OVERRIDE"
+read -r -a PROJECT_STRENGTHS <<< "$PROJECT_STRENGTHS_OVERRIDE"
 
 if [ "${#LAYERS[@]}" -eq 0 ]; then
   echo "[feature_interaction] No layers configured." >&2
@@ -108,6 +136,18 @@ fi
 if [ "${#PRIMARY_MODES[@]}" -eq 0 ]; then
   echo "[feature_interaction] No intervention modes configured." >&2
   exit 1
+fi
+
+if [ "${#PROJECT_STRENGTHS[@]}" -eq 0 ]; then
+  echo "[feature_interaction] No projection strengths configured." >&2
+  exit 1
+fi
+
+FIRST_ADAPTER_MODE="${PRIMARY_MODES[0]}"
+if [ "$FIRST_ADAPTER_MODE" = "project" ]; then
+  FIRST_ADAPTER_STRENGTH="${PROJECT_STRENGTHS[0]}"
+else
+  FIRST_ADAPTER_STRENGTH="${PRIMARY_STRENGTHS[0]}"
 fi
 
 slugify() {
@@ -144,13 +184,19 @@ run_job() {
     adapter_for_layer="$(expand_layer_path "$adapter_for_layer" "$layer")"
   fi
 
+  if [ "$ADAPTER_FIRST_COMBINATION_ONLY" = "1" ]; then
+    if [ "$primary_mode" != "$FIRST_ADAPTER_MODE" ] || [ "$primary_strength" != "$FIRST_ADAPTER_STRENGTH" ]; then
+      adapter_for_layer=""
+    fi
+  fi
+
   local exp_name
   exp_name="$(
     printf '%s' \
-      "${PRIMARY_FEATURE}_intervention_L${layer}_${primary_mode}_$(slugify "$primary_strength")"
+      "${PRIMARY_FEATURE}_adapter_probe_L${layer}_${primary_mode}_$(slugify "$primary_strength")"
   )"
 
-  echo "[feature_interaction] layer=${layer} intervention=${PRIMARY_FEATURE} mode=${primary_mode} strength=${primary_strength}; collect_features=${COLLECT_FEATURES_OVERRIDE}"
+  echo "[feature_interaction] layer=${layer} intervention=${PRIMARY_FEATURE} mode=${primary_mode} strength=${primary_strength}; adapter=${adapter_for_layer:-none}; adapter_first_combination_only=${ADAPTER_FIRST_COMBINATION_ONLY}; probe_type=${PROBE_TYPE}; probe_standardizer=${PROBE_STANDARDIZER}; probe_version=${PROBE_VERSION}; collect_features=${COLLECT_FEATURES_OVERRIDE}"
 
   local cmd=(
     python -m scripts.feature_interaction
@@ -159,6 +205,7 @@ run_job() {
     --model-filter-value "$MODEL_FILTER_VALUE"
     --feature "${PRIMARY_FEATURE}@${layer}:${primary_mode}:${primary_strength}:${PRIMARY_PROBE_VERSION}"
     --probe-type "$PROBE_TYPE"
+    --probe-standardizer "$PROBE_STANDARDIZER"
     --probe-dir "$PROBE_DIR"
     --probe-version "$PROBE_VERSION"
     --strength-unit "$STRENGTH_UNIT"
@@ -167,6 +214,7 @@ run_job() {
     --logprob-chunk-size "$LOGPROB_CHUNK_SIZE"
     --max-length "$MAX_LENGTH"
     --max-new-tokens "$MAX_NEW_TOKENS"
+    --adapter-min-new-tokens "$ADAPTER_MIN_NEW_TOKENS"
     --temperature "$TEMPERATURE"
     --top-p "$TOP_P"
     --seed "$SEED"
@@ -178,8 +226,30 @@ run_job() {
     --experiment-name "$exp_name"
   )
 
+  if [ -n "${REQUIRE_PROBE_ARGS_OVERRIDE:-}" ]; then
+    for required_probe_arg in ${REQUIRE_PROBE_ARGS_OVERRIDE}; do
+      cmd+=(--require-probe-arg "$required_probe_arg")
+    done
+  fi
+
   if [ "$NO_GRADIENT_COSINES" = "1" ]; then
     cmd+=(--no-gradient-cosines)
+  fi
+
+  if [ "$TOKEN_STATS_INCLUDE_TEXT" = "1" ]; then
+    cmd+=(--token-stats-include-text)
+  fi
+
+  if [ "$TOKEN_STATS_SKIP_SPECIAL" = "1" ]; then
+    cmd+=(--token-stats-skip-special)
+  fi
+
+  if [ "$SKIP_NEW_PROBE_STATS" = "1" ]; then
+    cmd+=(--skip-new-probe-stats)
+  fi
+
+  if [ "$SKIP_BASELINE_NEW_GENERATION" = "1" ]; then
+    cmd+=(--skip-baseline-new-generation)
   fi
 
   if [ "$ACTIVATION_COSINE_COMPARISON" = "1" ]; then
@@ -190,6 +260,10 @@ run_job() {
     cmd+=(--activation-cosine-layers "$ACTIVATION_COSINE_LAYERS")
   elif [ "$ACTIVATION_COSINE_COMPARISON" = "1" ] || [ -n "$adapter_for_layer" ]; then
     cmd+=(--activation-cosine-layers "$layer")
+  fi
+
+  if [ "$ACTIVATION_COSINE_COMPARISON" = "1" ]; then
+    cmd+=(--activation-cosine-batch-size "$ACTIVATION_COSINE_BATCH_SIZE")
   fi
 
   if [ -n "$adapter_for_layer" ]; then
@@ -224,7 +298,12 @@ run_job() {
 declare -a JOB_MATRIX=()
 for layer in "${LAYERS[@]}"; do
   for primary_mode in "${PRIMARY_MODES[@]}"; do
-    for primary_strength in "${PRIMARY_STRENGTHS[@]}"; do
+    if [ "$primary_mode" = "project" ]; then
+      mode_strengths=("${PROJECT_STRENGTHS[@]}")
+    else
+      mode_strengths=("${PRIMARY_STRENGTHS[@]}")
+    fi
+    for primary_strength in "${mode_strengths[@]}"; do
       JOB_MATRIX+=("${layer}|${primary_strength}|${primary_mode}")
     done
   done
@@ -232,6 +311,9 @@ done
 
 TOTAL_JOBS="${#JOB_MATRIX[@]}"
 echo "[feature_interaction] total_jobs=${TOTAL_JOBS}"
+if [ -n "${SLURM_ARRAY_TASK_MAX:-}" ] && [ "$SLURM_ARRAY_TASK_MAX" -lt $((TOTAL_JOBS - 1)) ]; then
+  echo "[feature_interaction] warning: Slurm array max=${SLURM_ARRAY_TASK_MAX}, but total_jobs=${TOTAL_JOBS}. Increase #SBATCH --array to 0-$((TOTAL_JOBS - 1)) to run every job." >&2
+fi
 
 if [ -n "${SLURM_ARRAY_TASK_ID:-}" ]; then
   TASK_ID="${SLURM_ARRAY_TASK_ID}"

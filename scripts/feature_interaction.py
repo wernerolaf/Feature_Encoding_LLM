@@ -191,6 +191,146 @@ def load_standardizer(metadata: dict | None, device: torch.device) -> Activation
     raise ValueError(f"Unknown standardizer strategy '{strategy}'.")
 
 
+def latest_probe_version_dir_matching(
+    *,
+    model_name: str,
+    layer: int,
+    label: str,
+    base_dir: str | Path,
+    allow_autoencoder: bool,
+) -> Path | None:
+    """Resolve the latest probe version matching an autoencoder/non-autoencoder requirement."""
+    probe_root = Path(base_dir) / sanitize_model_name(model_name) / f"layer{layer}" / label
+    if not probe_root.exists():
+        return None
+    pattern = re.compile(r"ver_(\d+)$")
+    version_dirs = sorted(
+        (p for p in probe_root.iterdir() if p.is_dir() and pattern.match(p.name)),
+        key=lambda p: int(pattern.match(p.name).group(1)),  # type: ignore[arg-type]
+        reverse=True,
+    )
+    for version_dir in version_dirs:
+        metadata_path = version_dir / "metadata.json"
+        if not metadata_path.exists():
+            continue
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except Exception:
+            continue
+        standardizer = metadata.get("standardizer")
+        autoencoder_artifact = metadata.get("autoencoder_artifact") or metadata.get("args", {}).get("autoencoder_artifact")
+        uses_autoencoder = standardizer == "autoencoder" or bool(autoencoder_artifact)
+        if uses_autoencoder == allow_autoencoder:
+            return version_dir
+    return None
+
+
+def metadata_uses_autoencoder(metadata: dict) -> bool:
+    standardizer = metadata.get("standardizer")
+    autoencoder_artifact = metadata.get("autoencoder_artifact") or metadata.get("args", {}).get("autoencoder_artifact")
+    return standardizer == "autoencoder" or bool(autoencoder_artifact)
+
+
+def normalize_probe_standardizer_requirement(value: str | None) -> str:
+    if value is None:
+        return "any"
+    normalized = value.strip().lower().replace("-", "_")
+    aliases = {
+        "ae": "autoencoder",
+        "sae": "autoencoder",
+        "no_ae": "raw",
+        "no_autoencoder": "raw",
+        "identity": "identity",
+        "standard": "standard",
+        "raw": "raw",
+        "any": "any",
+        "latest": "any",
+        "autoencoder": "autoencoder",
+    }
+    if normalized not in aliases:
+        raise ValueError(
+            f"Unknown probe standardizer requirement '{value}'. "
+            "Use any, raw, identity, standard, or autoencoder."
+        )
+    return aliases[normalized]
+
+
+def lookup_metadata_value(metadata: dict, key: str) -> object:
+    parts = key.split(".")
+    current: object = metadata
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
+
+
+def values_match_expected(actual: object, expected: str) -> bool:
+    if actual is None:
+        return False
+    actual_str = str(actual)
+    if actual_str == expected:
+        return True
+    try:
+        return float(actual) == float(expected)
+    except (TypeError, ValueError):
+        return actual_str.lower() == expected.lower()
+
+
+def validate_probe_metadata(
+    metadata: dict,
+    *,
+    path: Path,
+    label: str,
+    layer: int,
+    args: argparse.Namespace,
+) -> None:
+    errors: list[str] = []
+
+    metadata_model = metadata.get("model_name")
+    if metadata_model is not None and metadata_model != args.model_name:
+        errors.append(f"model_name={metadata_model!r} != requested {args.model_name!r}")
+
+    metadata_layer = metadata.get("layer")
+    if metadata_layer is not None and int(metadata_layer) != int(layer):
+        errors.append(f"layer={metadata_layer!r} != requested {layer!r}")
+
+    metadata_label = metadata.get("label_column") or metadata.get("target_feature")
+    if metadata_label is not None and str(metadata_label) != str(label):
+        errors.append(f"label={metadata_label!r} != requested {label!r}")
+
+    metadata_probe_type = metadata.get("probe_type")
+    if metadata_probe_type is not None and metadata_probe_type != args.probe_type:
+        errors.append(f"probe_type={metadata_probe_type!r} != requested {args.probe_type!r}")
+
+    requirement = normalize_probe_standardizer_requirement(args.probe_standardizer)
+    metadata_standardizer = metadata.get("standardizer") or "identity"
+    uses_autoencoder = metadata_uses_autoencoder(metadata)
+    if requirement == "raw" and uses_autoencoder:
+        errors.append("standardizer uses autoencoder but --probe-standardizer requires raw/non-autoencoder")
+    elif requirement == "autoencoder" and not uses_autoencoder:
+        errors.append("standardizer is non-autoencoder but --probe-standardizer requires autoencoder")
+    elif requirement in {"identity", "standard"} and metadata_standardizer != requirement:
+        errors.append(f"standardizer={metadata_standardizer!r} != required {requirement!r}")
+
+    for requirement_text in args.require_probe_arg:
+        if "=" not in requirement_text:
+            errors.append(f"invalid --require-probe-arg {requirement_text!r}; expected key=value")
+            continue
+        key, expected = requirement_text.split("=", 1)
+        key = key.strip()
+        expected = expected.strip()
+        actual = lookup_metadata_value(metadata, key)
+        if actual is None and not key.startswith("args."):
+            actual = lookup_metadata_value(metadata, f"args.{key}")
+        if not values_match_expected(actual, expected):
+            errors.append(f"metadata {key}={actual!r} != required {expected!r}")
+
+    if errors:
+        joined = "; ".join(errors)
+        raise ValueError(f"Probe metadata validation failed for {path}: {joined}")
+
+
 def load_probe_artifact(
     label: str,
     args: argparse.Namespace,
@@ -207,14 +347,31 @@ def load_probe_artifact(
     probe_version: str | int | None = probe_version_override if probe_version_override is not None else args.probe_version
     if isinstance(probe_version, str) and probe_version.isdigit():
         probe_version = int(probe_version)
-    version_dir = artifact_version_dir(
-        kind="probes",
-        model_name=args.model_name,
-        layer=layer,
-        label=label,
-        base_dir=args.probe_dir,
-        version=probe_version,
-    )
+    if isinstance(probe_version, str) and probe_version in {"latest_raw", "latest-no-autoencoder", "latest_no_autoencoder", "latest_no_ae"}:
+        version_dir = latest_probe_version_dir_matching(
+            model_name=args.model_name,
+            layer=layer,
+            label=label,
+            base_dir=args.probe_dir,
+            allow_autoencoder=False,
+        )
+    elif isinstance(probe_version, str) and probe_version in {"latest_autoencoder", "latest_ae"}:
+        version_dir = latest_probe_version_dir_matching(
+            model_name=args.model_name,
+            layer=layer,
+            label=label,
+            base_dir=args.probe_dir,
+            allow_autoencoder=True,
+        )
+    else:
+        version_dir = artifact_version_dir(
+            kind="probes",
+            model_name=args.model_name,
+            layer=layer,
+            label=label,
+            base_dir=args.probe_dir,
+            version=probe_version,
+        )
     if version_dir:
         candidates.append(version_dir / "probe.pkl")
     candidates.extend(
@@ -227,6 +384,42 @@ def load_probe_artifact(
     path = next((p for p in candidates if p.exists()), None)
     if path is None:
         raise FileNotFoundError(f"Missing probe artifact for '{label}'. Tried: {', '.join(str(p) for p in candidates)}")
+
+    metadata_path = path.parent / "metadata.json"
+    metadata_summary = {}
+    metadata: dict | None = None
+    if metadata_path.exists():
+        try:
+            metadata = json.loads(metadata_path.read_text())
+            validate_probe_metadata(metadata, path=path, label=label, layer=layer, args=args)
+            metrics = metadata.get("metrics", {}) or {}
+            metadata_summary = {
+                "standardizer": metadata.get("standardizer"),
+                "probe_type": metadata.get("probe_type"),
+                "layer_indexing": metadata.get("layer_indexing"),
+                "test_r2": metrics.get("test_r2"),
+                "test_accuracy": metrics.get("test_accuracy"),
+                "test_auc": metrics.get("test_auc"),
+            }
+        except Exception as exc:
+            raise ValueError(f"Failed to load/validate probe metadata at {metadata_path}: {exc}") from exc
+    elif not args.allow_missing_probe_metadata:
+        raise FileNotFoundError(
+            f"Probe artifact {path} has no metadata.json. "
+            "Pass --allow-missing-probe-metadata only for known legacy artifacts."
+        )
+    if metadata_summary:
+        print(
+            f"[probe] loaded feature={label} layer={layer} path={path} "
+            f"probe_type={metadata_summary.get('probe_type')} "
+            f"standardizer={metadata_summary.get('standardizer')} "
+            f"layer_indexing={metadata_summary.get('layer_indexing')} "
+            f"test_r2={metadata_summary.get('test_r2')} "
+            f"test_accuracy={metadata_summary.get('test_accuracy')} "
+            f"test_auc={metadata_summary.get('test_auc')}"
+        )
+    else:
+        print(f"[probe] loaded feature={label} layer={layer} path={path}")
 
     artifact = joblib.load(path)
     probe = artifact.get("probe")
@@ -328,6 +521,44 @@ def num_transformer_layers(model: AutoModelForCausalLM) -> int:
     return idx
 
 
+def resolve_hidden_backbone(model: AutoModelForCausalLM) -> torch.nn.Module:
+    """Return the transformer body when available, avoiding the causal-LM head."""
+    roots: list[object] = [model]
+    get_base_model = getattr(model, "get_base_model", None)
+    if callable(get_base_model):
+        try:
+            roots.append(get_base_model())
+        except Exception:
+            pass
+    roots.append(getattr(model, "base_model", None))
+
+    for root in list(roots):
+        if root is None:
+            continue
+        roots.extend(
+            getattr(root, name, None)
+            for name in ("model", "transformer", "encoder", "decoder", "gpt_neox", "backbone")
+        )
+
+    seen: set[int] = set()
+    for root in roots:
+        if root is None or not isinstance(root, torch.nn.Module):
+            continue
+        root_id = id(root)
+        if root_id in seen:
+            continue
+        seen.add(root_id)
+        if hasattr(root, "lm_head"):
+            continue
+        if any(hasattr(root, stack_name) for stack_name in ("layers", "h", "block")):
+            return root
+        decoder = getattr(root, "decoder", None)
+        if isinstance(decoder, torch.nn.Module) and hasattr(decoder, "layers"):
+            return decoder
+
+    return model
+
+
 def parse_layer_selection(selection: str | None, *, model: AutoModelForCausalLM) -> list[int]:
     if not selection:
         return []
@@ -416,13 +647,17 @@ class ProbeInterventionHook:
 
 
 class ActivationCaptureHook:
-    def __init__(self, captured: dict[int, torch.Tensor], *, layer_idx: int) -> None:
+    def __init__(self, captured: dict[int, torch.Tensor], *, layer_idx: int, capture_to_cpu: bool = False) -> None:
         self.captured = captured
         self.layer_idx = layer_idx
+        self.capture_to_cpu = capture_to_cpu
 
     def __call__(self, module, inputs, outputs):
         hidden, _ = ProbeInterventionHook._extract_hidden(outputs)
-        self.captured[self.layer_idx] = hidden.detach()
+        captured = hidden.detach()
+        if self.capture_to_cpu:
+            captured = captured.cpu()
+        self.captured[self.layer_idx] = captured
         return None
 
 
@@ -442,7 +677,8 @@ def compute_logprobs_and_entropy(outputs, generated_ids: torch.Tensor, *, chunk_
         for step, score in enumerate(scores):
             logp = torch.log_softmax(score, dim=-1)
             probs = torch.softmax(score, dim=-1)
-            entropy = -(probs * logp).sum(dim=-1)
+            entropy_terms = torch.where(probs > 0, probs * logp, torch.zeros_like(probs))
+            entropy = -entropy_terms.sum(dim=-1)
             token_ids = generated_ids[:, step]
             token_logprobs = logp.gather(1, token_ids.view(-1, 1)).squeeze(1)
             logprobs.append(tensor_to_numpy_float(token_logprobs))
@@ -470,7 +706,8 @@ def compute_logprobs_and_entropy(outputs, generated_ids: torch.Tensor, *, chunk_
         log_probs_chunk = torch.log_softmax(logits_chunk, dim=-1)
         probs_chunk = torch.exp(log_probs_chunk)
         gathered_chunks.append(log_probs_chunk.gather(2, target_chunk.unsqueeze(-1)).squeeze(-1).detach().float().cpu())
-        entropy_chunks.append((-(probs_chunk * log_probs_chunk).sum(dim=-1)).detach().float().cpu())
+        entropy_terms = torch.where(probs_chunk > 0, probs_chunk * log_probs_chunk, torch.zeros_like(probs_chunk))
+        entropy_chunks.append((-entropy_terms.sum(dim=-1)).detach().float().cpu())
         del logits_chunk, target_chunk, log_probs_chunk, probs_chunk
     gathered = torch.cat(gathered_chunks, dim=1)
     entropy = torch.cat(entropy_chunks, dim=1)
@@ -501,12 +738,14 @@ def run_generation(
     out_dir: Path,
     generate_new_tokens: bool = True,
     hook_active: bool = True,
+    score_probe_tokens: bool = True,
+    min_new_tokens: int = 0,
 ):
     cos_records: list[dict[str, object]] = []
     hooks: list[torch.utils.hooks.RemovableHandle] = []
-    if contexts_by_layer:
+    if hook_active and contexts_by_layer:
         for layer_idx, ctxs in contexts_by_layer.items():
-            hook_contexts = [ctx for ctx in ctxs if ctx.intervene]
+            hook_contexts = [ctx for ctx in ctxs if ctx.intervene and ctx.strength != 0]
             if not hook_contexts:
                 continue
             module = resolve_layer_module(model, layer_idx)
@@ -523,8 +762,14 @@ def run_generation(
         all_entropy: list[np.ndarray] = []
         all_token_ids: list[np.ndarray] = []
         per_token_preds: list[dict[str, list[float]]] = []
-        batch_size = max(1, args.generation_batch_size)
         run_label = f"{'intervention' if hook_active else 'baseline'}_{'new' if generate_new_tokens else 'old'}"
+        uses_hidden_state_probe_scoring = bool(contexts_by_layer and score_probe_tokens)
+        batch_size = max(
+            1,
+            args.generation_batch_size
+            if generate_new_tokens and not uses_hidden_state_probe_scoring
+            else args.batch_size,
+        )
         batch_starts = range(0, len(prompts), batch_size)
         total_batches = len(batch_starts)
         progress_style = "none" if args.no_progress else args.progress_style
@@ -558,6 +803,9 @@ def run_generation(
                 enc = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
                 with torch.no_grad():
                     if generate_new_tokens:
+                        generation_kwargs = {}
+                        if min_new_tokens > 0:
+                            generation_kwargs["min_new_tokens"] = min(min_new_tokens, args.max_new_tokens)
                         outputs = model.generate(
                             **enc,
                             max_new_tokens=args.max_new_tokens,
@@ -566,11 +814,12 @@ def run_generation(
                             top_p=args.top_p,
                             return_dict_in_generate=True,
                             output_scores=True,
+                            **generation_kwargs,
                         )
                         sequences = outputs.sequences
                         generated_ids = sequences[:, enc.input_ids.shape[1] :]
                     else:
-                        outputs = model(**enc, output_hidden_states=True)
+                        outputs = model(**enc)
                         generated_ids = enc.input_ids  # evaluate plausibility of existing sequence
 
                 # If no new tokens, still capture the prompt (or empty generation)
@@ -579,28 +828,40 @@ def run_generation(
                 all_logprobs.append(lp)
                 all_entropy.append(ent)
                 all_token_ids.extend(list(generated_ids.cpu().numpy()))
-                if contexts_by_layer:
-                    # compute gradient cosines on this batch of hidden states
+                if contexts_by_layer and score_probe_tokens:
+                    # The explicit capture pass below is a second forward.
+                    # Release logits/generation scores from the first forward
+                    # before running it; otherwise old-answer scoring can OOM
+                    # at the lm_head allocation.
+                    del outputs, sequences, generated_ids
+                    outputs = None
+                    sequences = None
+                    generated_ids = None
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    # Score probes on post-hook layer outputs. Hugging Face
+                    # output_hidden_states can expose the layer value before a
+                    # forward hook's returned replacement is reflected at that
+                    # same layer, so use an explicit capture hook here.
                     with torch.no_grad():
-                        attention_mask = enc["attention_mask"]
-                        if hasattr(outputs, "hidden_states") and outputs.hidden_states is not None:
-                            hidden_states = outputs.hidden_states
-                        else:
-                            enc_for_hidden = tokenizer(batch_prompts, return_tensors="pt", padding=True).to(device)
-                            hidden_states = model(**enc_for_hidden, output_hidden_states=True).hidden_states
-                            attention_mask = enc_for_hidden["attention_mask"]
-                        # align mask and hidden length defensively
-                        seq_len = min(attention_mask.shape[1], hidden_states[0].shape[1])
-                        attention_mask = attention_mask[:, :seq_len]
-                        total_layers = len(hidden_states)
                         layer_items = sorted(contexts_by_layer.items(), key=lambda kv: kv[0])
+                        score_layers = [layer_idx for layer_idx, _ in layer_items]
+                        captured_states, attention_mask = hidden_states_for_batch(
+                            model,
+                            tokenizer,
+                            batch_prompts,
+                            layers=score_layers,
+                            contexts_by_layer=contexts_by_layer,
+                            device=device,
+                            max_length=args.max_length,
+                            hook_active=False,
+                            disable_adapter=False,
+                            capture_to_cpu=True,
+                        )
                         for layer_idx, ctxs in layer_items:
                             layers_scored += 1
-                            # hidden_states includes embeddings at position 0; shift positives by +1
-                            idx = layer_idx + 1 if layer_idx >= 0 else total_layers + layer_idx
-                            if idx < 0 or idx >= total_layers:
-                                raise IndexError(f"Requested layer index {layer_idx} maps to hidden_states[{idx}] out of range 0..{total_layers-1}")
-                            layer_states = hidden_states[idx][:, :seq_len, :]
+                            layer_states = captured_states[layer_idx]
                             valid_mask = attention_mask.bool()
                             flat_t = layer_states[valid_mask]
                             flat_np = None if args.no_gradient_cosines else tensor_to_numpy_float(flat_t)
@@ -649,6 +910,10 @@ def run_generation(
                                     entry = per_token_preds[idx_global]
                                     entry[pred_key] = filled[bi].tolist()
 
+                        del captured_states, attention_mask
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
             finally:
                 del outputs, sequences, generated_ids, hidden_states, layer_states, flat_t, flat_np, enc_for_hidden, enc
                 if torch.cuda.is_available():
@@ -694,6 +959,107 @@ def run_generation(
             h.remove()
 
 
+def score_continuation_token_ids(
+    model: AutoModelForCausalLM,
+    tokenizer: AutoTokenizer,
+    *,
+    prompts: list[str],
+    continuation_token_ids: list[np.ndarray],
+    contexts_by_layer: dict[int, list[FeatureProbeContext]],
+    device: torch.device,
+    args: argparse.Namespace,
+    hook_active: bool,
+) -> np.ndarray:
+    """
+    Score fixed continuation token IDs after each prompt.
+
+    This is used for fair same-text comparisons: the comparison condition scores
+    the baseline model's generated continuation tokens instead of scoring its own
+    independently generated text.
+    """
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
+    if hook_active and contexts_by_layer:
+        for layer_idx, ctxs in contexts_by_layer.items():
+            hook_contexts = [ctx for ctx in ctxs if ctx.intervene and ctx.strength != 0]
+            if not hook_contexts:
+                continue
+            module = resolve_layer_module(model, layer_idx)
+            intervention_hook = ProbeInterventionHook(hook_contexts, layer_idx=layer_idx, output_dir=Path("."))
+            intervention_hook.active = hook_active
+            hooks.append(module.register_forward_hook(intervention_hook))
+
+    try:
+        tokenizer.padding_side = "right"
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        rows: list[np.ndarray] = []
+        batch_size = max(1, args.generation_batch_size)
+        for start in range(0, len(prompts), batch_size):
+            batch_prompts = prompts[start : start + batch_size]
+            batch_continuations = continuation_token_ids[start : start + batch_size]
+            prompt_ids = [
+                tokenizer(prompt, add_special_tokens=True, return_attention_mask=False)["input_ids"]
+                for prompt in batch_prompts
+            ]
+            full_ids: list[list[int]] = []
+            continuation_starts: list[int] = []
+            continuation_lengths: list[int] = []
+            for ids, continuation in zip(prompt_ids, batch_continuations):
+                continuation_list = [int(token_id) for token_id in np.asarray(continuation).reshape(-1).tolist()]
+                continuation_starts.append(len(ids))
+                continuation_lengths.append(len(continuation_list))
+                full_ids.append(ids + continuation_list)
+
+            max_len = max(len(ids) for ids in full_ids)
+            pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+            if pad_id is None:
+                raise ValueError("Tokenizer must define pad_token_id or eos_token_id for continuation scoring.")
+            input_ids = torch.full((len(full_ids), max_len), int(pad_id), dtype=torch.long, device=device)
+            attention_mask = torch.zeros((len(full_ids), max_len), dtype=torch.long, device=device)
+            for row_idx, ids in enumerate(full_ids):
+                row = torch.tensor(ids, dtype=torch.long, device=device)
+                input_ids[row_idx, : row.numel()] = row
+                attention_mask[row_idx, : row.numel()] = 1
+
+            with torch.no_grad():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits
+            logprob_rows: list[np.ndarray] = []
+            for row_idx, (cont_start, cont_len) in enumerate(zip(continuation_starts, continuation_lengths)):
+                values = np.full(cont_len, np.nan, dtype=np.float32)
+                score_start = max(cont_start - 1, 0)
+                score_end = min(cont_start + cont_len - 1, input_ids.shape[1] - 1)
+                if score_end > score_start:
+                    target_start = score_start + 1
+                    target_end = score_end + 1
+                    offset = target_start - cont_start
+                    target_ids = input_ids[row_idx, target_start:target_end]
+                    step = max(1, args.logprob_chunk_size)
+                    for chunk_start in range(0, target_ids.numel(), step):
+                        chunk_end = min(target_ids.numel(), chunk_start + step)
+                        logits_chunk = logits[row_idx, score_start + chunk_start : score_start + chunk_end, :]
+                        target_chunk = target_ids[chunk_start:chunk_end]
+                        logp_chunk = torch.log_softmax(logits_chunk, dim=-1)
+                        gathered = logp_chunk.gather(1, target_chunk.unsqueeze(1)).squeeze(1)
+                        values[offset + chunk_start : offset + chunk_end] = tensor_to_numpy_float(gathered)
+                logprob_rows.append(values)
+
+            rows.extend(logprob_rows)
+            del outputs, logits, input_ids, attention_mask
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        max_cols = max((row.shape[0] for row in rows), default=0)
+        scored = np.full((len(rows), max_cols), np.nan, dtype=np.float32)
+        for row_idx, row in enumerate(rows):
+            scored[row_idx, : row.shape[0]] = row
+        return scored
+    finally:
+        for h in hooks:
+            h.remove()
+
+
 def hidden_states_for_batch(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -705,6 +1071,7 @@ def hidden_states_for_batch(
     max_length: int,
     hook_active: bool,
     disable_adapter: bool,
+    capture_to_cpu: bool = False,
 ) -> tuple[dict[int, torch.Tensor], torch.Tensor]:
     hooks: list[torch.utils.hooks.RemovableHandle] = []
     captured: dict[int, torch.Tensor] = {}
@@ -713,13 +1080,13 @@ def hidden_states_for_batch(
         module = resolve_layer_module(model, layer_idx)
         if hook_active and layer_idx in contexts_by_layer:
             ctxs = contexts_by_layer[layer_idx]
-            hook_contexts = [ctx for ctx in ctxs if ctx.intervene]
+            hook_contexts = [ctx for ctx in ctxs if ctx.intervene and ctx.strength != 0]
             if hook_contexts:
                 intervention_hook = ProbeInterventionHook(hook_contexts, layer_idx=layer_idx, output_dir=Path("."))
                 intervention_hook.active = True
                 hooks.append(module.register_forward_hook(intervention_hook))
         if layer_idx in layers:
-            hooks.append(module.register_forward_hook(ActivationCaptureHook(captured, layer_idx=layer_idx)))
+            hooks.append(module.register_forward_hook(ActivationCaptureHook(captured, layer_idx=layer_idx, capture_to_cpu=capture_to_cpu)))
 
     ctx = adapter_disabled_context(model) if disable_adapter else nullcontext()
     try:
@@ -733,8 +1100,11 @@ def hidden_states_for_batch(
         ).to(device)
         with ctx:
             with torch.no_grad():
-                model(**enc)
+                backbone = resolve_hidden_backbone(model)
+                backbone(**enc)
         attention_mask = enc["attention_mask"]
+        if capture_to_cpu:
+            attention_mask = attention_mask.cpu()
         missing = [layer_idx for layer_idx in layers if layer_idx not in captured]
         if missing:
             raise RuntimeError(f"Did not capture activation outputs for layers {missing}.")
@@ -765,6 +1135,17 @@ def summarize_cosine_values(values_list: list[np.ndarray]) -> dict[str, float | 
     }
 
 
+def summarize_tensor_norms(values: torch.Tensor) -> dict[str, float]:
+    norms = values.norm(dim=-1).detach().float().cpu().numpy()
+    stats = summarize_cosine_values([norms])
+    return {
+        "mean": float(stats["mean"]),
+        "std": float(stats["std"]),
+        "min": float(stats["min"]),
+        "max": float(stats["max"]),
+    }
+
+
 def save_activation_cosine_comparison(
     output_dir: Path,
     model: AutoModelForCausalLM,
@@ -780,11 +1161,64 @@ def save_activation_cosine_comparison(
         print("[activation_cosine] no layers requested; skipping.")
         return
 
-    batch_size = max(1, args.generation_batch_size)
-    pair_similarities: dict[tuple[str, int, int], list[np.ndarray]] = {}
+    batch_size = max(1, args.activation_cosine_batch_size)
+    records: list[dict[str, float | int | str]] = []
     has_adapter = bool(args.adapter_path)
     batch_starts = range(0, len(prompts), batch_size)
-    print(f"[activation_cosine] prompts={len(prompts)} layers={layers} adapter={has_adapter}", flush=True)
+    print(
+        f"[activation_cosine] prompts={len(prompts)} layers={layers} "
+        f"adapter={has_adapter} batch_size={batch_size}",
+        flush=True,
+    )
+
+    def append_comparison_record(
+        pair: str,
+        layer_idx: int,
+        prompt_idx: int,
+        source: torch.Tensor,
+        target: torch.Tensor,
+    ) -> None:
+        similarity = torch.nn.functional.cosine_similarity(source, target, dim=-1).detach().float().cpu().numpy()
+        sim_stats = summarize_cosine_values([similarity])
+        dist_stats = summarize_cosine_values([1.0 - similarity])
+        source_norm = summarize_tensor_norms(source)
+        target_norm = summarize_tensor_norms(target)
+        delta = target - source
+        delta_norm = summarize_tensor_norms(delta)
+        rel_delta = delta.norm(dim=-1) / source.norm(dim=-1).clamp_min(1e-12)
+        rel_delta_stats = summarize_cosine_values([rel_delta.detach().float().cpu().numpy()])
+        records.append(
+            {
+                "prompt_index": prompt_idx,
+                "pair": pair,
+                "layer": layer_idx,
+                "tokens": sim_stats["tokens"],
+                "cosine_similarity_mean": sim_stats["mean"],
+                "cosine_similarity_std": sim_stats["std"],
+                "cosine_similarity_min": sim_stats["min"],
+                "cosine_similarity_max": sim_stats["max"],
+                "cosine_distance_mean": dist_stats["mean"],
+                "cosine_distance_std": dist_stats["std"],
+                "cosine_distance_min": dist_stats["min"],
+                "cosine_distance_max": dist_stats["max"],
+                "source_norm_mean": source_norm["mean"],
+                "source_norm_std": source_norm["std"],
+                "source_norm_min": source_norm["min"],
+                "source_norm_max": source_norm["max"],
+                "target_norm_mean": target_norm["mean"],
+                "target_norm_std": target_norm["std"],
+                "target_norm_min": target_norm["min"],
+                "target_norm_max": target_norm["max"],
+                "delta_norm_mean": delta_norm["mean"],
+                "delta_norm_std": delta_norm["std"],
+                "delta_norm_min": delta_norm["min"],
+                "delta_norm_max": delta_norm["max"],
+                "relative_delta_norm_mean": rel_delta_stats["mean"],
+                "relative_delta_norm_std": rel_delta_stats["std"],
+                "relative_delta_norm_min": rel_delta_stats["min"],
+                "relative_delta_norm_max": rel_delta_stats["max"],
+            }
+        )
 
     for start in batch_starts:
         batch_prompts = prompts[start : start + batch_size]
@@ -798,6 +1232,7 @@ def save_activation_cosine_comparison(
             max_length=args.max_length,
             hook_active=False,
             disable_adapter=has_adapter,
+            capture_to_cpu=True,
         )
         intervention, intervention_mask = hidden_states_for_batch(
             model,
@@ -809,6 +1244,7 @@ def save_activation_cosine_comparison(
             max_length=args.max_length,
             hook_active=True,
             disable_adapter=has_adapter,
+            capture_to_cpu=True,
         )
         if not torch.equal(valid_mask, intervention_mask):
             raise ValueError("Original and intervention attention masks differ; cannot compare activations.")
@@ -826,6 +1262,7 @@ def save_activation_cosine_comparison(
                 max_length=args.max_length,
                 hook_active=False,
                 disable_adapter=False,
+                capture_to_cpu=True,
             )
             if not torch.equal(valid_mask, adapter_mask):
                 raise ValueError("Original and adapter attention masks differ; cannot compare activations.")
@@ -836,61 +1273,44 @@ def save_activation_cosine_comparison(
                 mask = valid_mask[batch_idx]
                 original_prompt = original[layer_idx][batch_idx, mask].float()
                 intervention_prompt = intervention[layer_idx][batch_idx, mask].float()
-                sim = torch.nn.functional.cosine_similarity(original_prompt, intervention_prompt, dim=-1)
-                sim_np = sim.detach().float().cpu().numpy()
-                pair_similarities.setdefault(("original_vs_intervention", layer_idx, prompt_idx), []).append(sim_np)
+                append_comparison_record(
+                    "original_vs_intervention",
+                    layer_idx,
+                    prompt_idx,
+                    original_prompt,
+                    intervention_prompt,
+                )
 
                 if adapter is not None:
                     adapter_prompt = adapter[layer_idx][batch_idx, mask].float()
-                    sim = torch.nn.functional.cosine_similarity(original_prompt, adapter_prompt, dim=-1)
-                    sim_np = sim.detach().float().cpu().numpy()
-                    pair_similarities.setdefault(("original_vs_adapter", layer_idx, prompt_idx), []).append(sim_np)
+                    append_comparison_record("original_vs_adapter", layer_idx, prompt_idx, original_prompt, adapter_prompt)
+                    append_comparison_record(
+                        "adapter_vs_intervention",
+                        layer_idx,
+                        prompt_idx,
+                        adapter_prompt,
+                        intervention_prompt,
+                    )
+                    adapter_delta = adapter_prompt - original_prompt
+                    intervention_delta = intervention_prompt - original_prompt
+                    append_comparison_record(
+                        "delta_adapter_vs_delta_intervention",
+                        layer_idx,
+                        prompt_idx,
+                        adapter_delta,
+                        intervention_delta,
+                    )
 
         del original, intervention, adapter
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    path = output_dir / "activation_cosine_distances.csv"
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f,
-            fieldnames=[
-                "prompt_index",
-                "pair",
-                "layer",
-                "tokens",
-                "cosine_similarity_mean",
-                "cosine_similarity_std",
-                "cosine_similarity_min",
-                "cosine_similarity_max",
-                "cosine_distance_mean",
-                "cosine_distance_std",
-                "cosine_distance_min",
-                "cosine_distance_max",
-            ],
-        )
-        writer.writeheader()
-        for (pair, layer_idx, prompt_idx), chunks in sorted(pair_similarities.items(), key=lambda item: (item[0][2], item[0][0], item[0][1])):
-            sim_stats = summarize_cosine_values(chunks)
-            dist_chunks = [1.0 - chunk for chunk in chunks]
-            dist_stats = summarize_cosine_values(dist_chunks)
-            writer.writerow(
-                {
-                    "prompt_index": prompt_idx,
-                    "pair": pair,
-                    "layer": layer_idx,
-                    "tokens": sim_stats["tokens"],
-                    "cosine_similarity_mean": sim_stats["mean"],
-                    "cosine_similarity_std": sim_stats["std"],
-                    "cosine_similarity_min": sim_stats["min"],
-                    "cosine_similarity_max": sim_stats["max"],
-                    "cosine_distance_mean": dist_stats["mean"],
-                    "cosine_distance_std": dist_stats["std"],
-                    "cosine_distance_min": dist_stats["min"],
-                    "cosine_distance_max": dist_stats["max"],
-                }
-            )
+    path = output_dir / "activation_cosine_distances.parquet"
+    df = pd.DataFrame.from_records(records)
+    if not df.empty:
+        df = df.sort_values(["prompt_index", "pair", "layer"]).reset_index(drop=True)
+    df.to_parquet(path, index=False, compression="zstd")
     print(f"[activation_cosine] saved {path}", flush=True)
 
 
@@ -1059,15 +1479,15 @@ def save_generations(
     baseline_logprobs: Optional[np.ndarray],
     intervened_logprobs: Optional[np.ndarray],
     tag: str,
+    logprob_deltas: Optional[np.ndarray] = None,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     generations_path = output_dir / f"generations_{tag}.json"
     payload = []
-    if baseline_logprobs is not None and intervened_logprobs is not None:
-        min_len = min(baseline_logprobs.shape[1], intervened_logprobs.shape[1])
-        clipped_base = baseline_logprobs[:, :min_len]
-        clipped_int = intervened_logprobs[:, :min_len]
-        deltas = (clipped_int - clipped_base).mean(axis=1)
+    if logprob_deltas is not None:
+        deltas = logprob_deltas
+    elif baseline_logprobs is not None and intervened_logprobs is not None:
+        deltas = average_logprob_delta(baseline_logprobs, intervened_logprobs)
     else:
         deltas = np.full(len(prompts), np.nan)
 
@@ -1082,6 +1502,23 @@ def save_generations(
             }
         )
     generations_path.write_text(json.dumps(payload, indent=2))
+
+
+def average_logprob_delta(baseline_logprobs: np.ndarray, comparison_logprobs: np.ndarray) -> np.ndarray:
+    min_rows = min(baseline_logprobs.shape[0], comparison_logprobs.shape[0])
+    min_cols = min(baseline_logprobs.shape[1], comparison_logprobs.shape[1])
+    clipped_base = baseline_logprobs[:min_rows, :min_cols]
+    clipped_cmp = comparison_logprobs[:min_rows, :min_cols]
+    diff = clipped_cmp - clipped_base
+    finite = np.isfinite(diff)
+    counts = finite.sum(axis=1)
+    sums = np.where(finite, diff, 0.0).sum(axis=1)
+    return np.divide(
+        sums,
+        counts,
+        out=np.full(sums.shape, np.nan, dtype=float),
+        where=counts > 0,
+    )
 
 
 def compute_gradient_cosines(
@@ -1139,7 +1576,10 @@ def torch_linear_probe_predict_scalar(ctx: FeatureProbeContext, flat_t: torch.Te
     cache = getattr(ctx, "_torch_linear_cache", {})
     cached = cache.get(cache_key)
     if cached is None:
-        coef = torch.as_tensor(np.asarray(coef_np), device=flat_t.device, dtype=torch.float32)
+        coef_arr = np.asarray(coef_np)
+        if coef_arr.ndim == 1:
+            coef_arr = coef_arr.reshape(1, -1)
+        coef = torch.as_tensor(coef_arr, device=flat_t.device, dtype=torch.float32)
         intercept = torch.as_tensor(np.asarray(intercept_np), device=flat_t.device, dtype=torch.float32).reshape(-1)
         mean = None
         scale = None
@@ -1256,7 +1696,14 @@ def parse_args() -> argparse.Namespace:
                         help="Disable filtering dataset rows by --model-name.")
     parser.add_argument("--layer", type=int, default=None, help="Optional default layer applied to any feature without an explicit layer.")
     parser.add_argument("--probe-dir", default="artifacts/probes", help="Directory containing pre-trained probe artifacts.")
-    parser.add_argument("--probe-version", default="latest", help="Probe artifact version to load, e.g. 'latest' or '73'.")
+    parser.add_argument(
+        "--probe-version",
+        default="latest",
+        help=(
+            "Probe artifact version to load, e.g. 'latest', '73', 'latest_raw' "
+            "for latest non-autoencoder probe, or 'latest_autoencoder'."
+        ),
+    )
     parser.add_argument("--text-column", default=None)
     parser.add_argument("--prompt-template", default=PROMPT_TEMPLATE)
     parser.add_argument("--template-fields", nargs="+", default=["gender", "level", "trait", "belief", "question", "type", "pronoun"])
@@ -1271,6 +1718,12 @@ def parse_args() -> argparse.Namespace:
                         help="Additional layers to observe for every requested feature without intervening. Use 'all', '0,4,8', or ranges like '0-31'.")
     parser.add_argument("--probe-type", choices=["linear", "decision_tree", "shallow_nn"], default="linear",
                         help="Probe type used in artifact naming (no training happens here).")
+    parser.add_argument("--probe-standardizer", default="any",
+                        help="Required loaded probe standardizer: any, raw/no_autoencoder, identity, standard, or autoencoder.")
+    parser.add_argument("--require-probe-arg", action="append", default=[],
+                        help="Require a metadata key/value on every loaded probe, e.g. --require-probe-arg args.logistic_penalty=l2.")
+    parser.add_argument("--allow-missing-probe-metadata", action="store_true",
+                        help="Allow loading legacy probe artifacts without metadata.json.")
     parser.add_argument("--output-dir", default="artifacts/experiments", help="Base directory for experiment outputs.")
     parser.add_argument("--experiment-name", default="feature_interaction", help="Name used for versioned experiment directory.")
     parser.add_argument(
@@ -1286,6 +1739,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default="float32")
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--adapter-min-new-tokens", type=int, default=0,
+                        help="Minimum new tokens for adapter-only generation. Use this to avoid immediate empty EOS generations from adapters.")
     parser.add_argument("--temperature", type=float, default=0.9)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument("--do-sample", action="store_true")
@@ -1298,14 +1753,20 @@ def parse_args() -> argparse.Namespace:
                         help="Include decoded token text in token-level outputs (larger files).")
     parser.add_argument("--token-stats-skip-special", action="store_true",
                         help="Skip special tokens when exporting token-level stats.")
+    parser.add_argument("--skip-new-probe-stats", action="store_true",
+                        help="Do not run the extra hidden-state/probe pass for new generations. Generation text and logprob deltas are still saved.")
+    parser.add_argument("--skip-baseline-new-generation", action="store_true",
+                        help="Skip base-model new generation. Old-answer scoring still provides the shared-text baseline.")
     parser.add_argument("--no-gradient-cosines", action="store_true",
                         help="Skip gradient cosine computation and do not write gradient_cosines.csv.")
     parser.add_argument("--adapter-path", default=None,
                         help="Optional PEFT adapter directory used for activation cosine comparison.")
     parser.add_argument("--activation-cosine-comparison", action="store_true",
-                        help="Write activation_cosine_distances.csv comparing original, adapter, and intervention activations.")
+                        help="Write activation_cosine_distances.parquet comparing original, adapter, and intervention activations.")
     parser.add_argument("--activation-cosine-layers", default=None,
                         help="Layers for activation cosine comparison. Defaults to the experiment layers. Use 'all', '0,4,8', or ranges like '0-31'.")
+    parser.add_argument("--activation-cosine-batch-size", type=int, default=1,
+                        help="Batch size for activation cosine hidden-state capture. Lower values reduce GPU memory.")
     parser.add_argument("--progress-style", choices=["line", "tqdm", "none"], default="line",
                         help="Progress reporting style. 'line' is Slurm-friendly; 'tqdm' is better for interactive terminals.")
     parser.add_argument("--no-progress", action="store_true",
@@ -1479,18 +1940,28 @@ def main() -> None:
         hook_active=True,
     )
 
-    # Pass 3: new generation without interventions
-    baseline_generations, _, baseline_logprobs, baseline_entropy, baseline_token_ids, baseline_cos, baseline_token_preds = run_generation(
-        model,
-        tokenizer,
-        prompts=gen_prompts,
-        contexts_by_layer=contexts_by_layer,
-        device=device,
-        args=args,
-        out_dir=out_dir,
-        generate_new_tokens=True,
-        hook_active=False,
-    )
+    if args.skip_baseline_new_generation:
+        print("[baseline_new] skipped base-model new generation.", flush=True)
+        baseline_generations = [""] * len(gen_prompts)
+        baseline_logprobs = None
+        baseline_entropy = None
+        baseline_token_ids: list[np.ndarray] = []
+        baseline_cos: list[dict[str, object]] = []
+        baseline_token_preds: list[dict[str, list[float]]] = []
+    else:
+        # Pass 3: new generation without interventions
+        baseline_generations, _, baseline_logprobs, baseline_entropy, baseline_token_ids, baseline_cos, baseline_token_preds = run_generation(
+            model,
+            tokenizer,
+            prompts=gen_prompts,
+            contexts_by_layer=contexts_by_layer,
+            device=device,
+            args=args,
+            out_dir=out_dir,
+            generate_new_tokens=True,
+            hook_active=False,
+            score_probe_tokens=not args.skip_new_probe_stats,
+        )
 
     # Pass 4: new generation with interventions
     generations, _, logprobs, entropy, token_ids, cos_records, intervened_token_preds = run_generation(
@@ -1503,7 +1974,81 @@ def main() -> None:
         out_dir=out_dir,
         generate_new_tokens=True,
         hook_active=True,
+        score_probe_tokens=not args.skip_new_probe_stats,
     )
+
+    intervention_baseline_logprobs = None
+    if baseline_token_ids:
+        intervention_baseline_logprobs = score_continuation_token_ids(
+            model,
+            tokenizer,
+            prompts=gen_prompts,
+            continuation_token_ids=baseline_token_ids,
+            contexts_by_layer=contexts_by_layer,
+            device=device,
+            args=args,
+            hook_active=True,
+        )
+
+    adapter_loaded = False
+    adapter_old_logprobs = None
+    adapter_old_entropy = None
+    adapter_old_token_ids: list[np.ndarray] = []
+    adapter_old_cos: list[dict[str, object]] = []
+    adapter_old_token_preds: list[dict[str, list[float]]] = []
+    adapter_generations: list[str] = []
+    adapter_new_logprobs = None
+    adapter_new_entropy = None
+    adapter_new_token_ids: list[np.ndarray] = []
+    adapter_new_cos: list[dict[str, object]] = []
+    adapter_new_token_preds: list[dict[str, list[float]]] = []
+    adapter_baseline_logprobs = None
+
+    if args.adapter_path:
+        print(f"[adapter] loading adapter {args.adapter_path}", flush=True)
+        model = load_peft_adapter_if_requested(model, args.adapter_path, is_trainable=False)
+        model.to(device)
+        model.eval()
+        adapter_loaded = True
+
+        # Pass 5: adapter-only scoring of old answers.
+        _, _, adapter_old_logprobs, adapter_old_entropy, adapter_old_token_ids, adapter_old_cos, adapter_old_token_preds = run_generation(
+            model,
+            tokenizer,
+            prompts=full_texts,
+            contexts_by_layer=contexts_by_layer,
+            device=device,
+            args=args,
+            out_dir=out_dir,
+            generate_new_tokens=False,
+            hook_active=False,
+        )
+
+        # Pass 6: adapter-only new generation.
+        adapter_generations, _, adapter_new_logprobs, adapter_new_entropy, adapter_new_token_ids, adapter_new_cos, adapter_new_token_preds = run_generation(
+            model,
+            tokenizer,
+            prompts=gen_prompts,
+            contexts_by_layer=contexts_by_layer,
+            device=device,
+            args=args,
+            out_dir=out_dir,
+            generate_new_tokens=True,
+            hook_active=False,
+            score_probe_tokens=not args.skip_new_probe_stats,
+            min_new_tokens=args.adapter_min_new_tokens,
+        )
+        if baseline_token_ids:
+            adapter_baseline_logprobs = score_continuation_token_ids(
+                model,
+                tokenizer,
+                prompts=gen_prompts,
+                continuation_token_ids=baseline_token_ids,
+                contexts_by_layer=contexts_by_layer,
+                device=device,
+                args=args,
+                hook_active=False,
+            )
 
     all_contexts = [ctx for _, layer_contexts in sorted(contexts_by_layer.items(), key=lambda kv: kv[0]) for ctx in layer_contexts]
 
@@ -1567,6 +2112,37 @@ def main() -> None:
         skip_special_tokens=args.token_stats_skip_special,
     )
 
+    if adapter_loaded:
+        save_token_stats(
+            out_dir,
+            tokenizer,
+            prompts=full_texts,
+            token_ids=adapter_old_token_ids,
+            logprobs=adapter_old_logprobs,
+            entropy=adapter_old_entropy,
+            contexts=all_contexts,
+            token_preds=adapter_old_token_preds,
+            tag="token_stats_adapter_old",
+            file_format=args.token_stats_format,
+            include_token_text=args.token_stats_include_text,
+            skip_special_tokens=args.token_stats_skip_special,
+        )
+
+        save_token_stats(
+            out_dir,
+            tokenizer,
+            prompts=gen_prompts,
+            token_ids=adapter_new_token_ids,
+            logprobs=adapter_new_logprobs,
+            entropy=adapter_new_entropy,
+            contexts=all_contexts,
+            token_preds=adapter_new_token_preds,
+            tag="token_stats_adapter_new",
+            file_format=args.token_stats_format,
+            include_token_text=args.token_stats_include_text,
+            skip_special_tokens=args.token_stats_skip_special,
+        )
+
     save_generations(
         out_dir,
         gen_prompts,
@@ -1575,6 +2151,7 @@ def main() -> None:
         baseline_logprobs,
         logprobs,
         tag="intervention_new",
+        logprob_deltas=average_logprob_delta(baseline_logprobs, intervention_baseline_logprobs) if baseline_logprobs is not None and intervention_baseline_logprobs is not None else None,
     )
 
     save_generations(
@@ -1607,13 +2184,35 @@ def main() -> None:
         tag="baseline_new",
     )
 
+    if adapter_loaded:
+        save_generations(
+            out_dir,
+            full_texts,
+            [""] * len(full_texts),
+            [""] * len(full_texts),
+            neutral_logprobs,
+            adapter_old_logprobs,
+            tag="adapter_old",
+        )
+
+        save_generations(
+            out_dir,
+            gen_prompts,
+            baseline_generations,
+            adapter_generations,
+            baseline_logprobs,
+            adapter_new_logprobs,
+            tag="adapter_new",
+            logprob_deltas=average_logprob_delta(baseline_logprobs, adapter_baseline_logprobs) if baseline_logprobs is not None and adapter_baseline_logprobs is not None else None,
+        )
+
     if args.activation_cosine_comparison or args.adapter_path:
         comparison_layers = (
             parse_layer_selection(args.activation_cosine_layers, model=model)
             if args.activation_cosine_layers
             else sorted(layers)
         )
-        if args.adapter_path:
+        if args.adapter_path and not adapter_loaded:
             print(f"[activation_cosine] loading adapter {args.adapter_path}", flush=True)
             model = load_peft_adapter_if_requested(model, args.adapter_path, is_trainable=False)
             model.to(device)
@@ -1629,7 +2228,7 @@ def main() -> None:
             args=args,
         )
 
-    all_cos = cos_records + neutral_cos + active_cos + baseline_cos
+    all_cos = cos_records + neutral_cos + active_cos + baseline_cos + adapter_old_cos + adapter_new_cos
     save_gradient_cosines(out_dir, all_cos)
 
     save_metadata(out_dir, args, feature_specs, sorted(layers), data_hash=data_hash)

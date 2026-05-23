@@ -60,13 +60,13 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="One or more label columns to train probes for (overrides --label-column).",
     )
-    parser.add_argument("--layer", type=int, default=-1, help="Hidden-state index to extract.")
+    parser.add_argument("--layer", type=int, default=-1, help="Transformer block index to extract. Layer k means the output of model.layers[k].")
     parser.add_argument(
         "--layers",
         type=int,
         nargs="+",
         default=None,
-        help="One or more hidden-state indices to extract (overrides --layer).",
+        help="One or more transformer block indices to extract (overrides --layer). Layer k means the output of model.layers[k].",
     )
     parser.add_argument("--text-column", default=None, help="Use this column directly if provided.")
     parser.add_argument(
@@ -290,6 +290,14 @@ def collect_layer_activations(
     max_length: int,
     args_tqdm: bool,
 ) -> tuple[dict[int, np.ndarray], list[int]]:
+    """
+    Collect token activations using the same layer convention as feature_interaction.py.
+
+    Requested layer k means the output of transformer block model.layers[k].
+    Hugging Face output_hidden_states includes the embedding state at index 0,
+    so block k output is hidden_states[k + 1]. This avoids training probes on
+    the embedding stream or the previous block by accident.
+    """
     if not texts:
         raise ValueError("No texts supplied for activation extraction.")
 
@@ -323,10 +331,10 @@ def collect_layer_activations(
             total = len(hidden_states)
             resolved_layers = {}
             for layer in ordered_layers:
-                resolved_idx = layer if layer >= 0 else total + layer
+                resolved_idx = layer + 1 if layer >= 0 else total + layer
                 if resolved_idx < 0 or resolved_idx >= total:
                     raise ValueError(
-                        f"Layer {layer} resolves to {resolved_idx}, but only {total} hidden states are available."
+                        f"Layer {layer} resolves to hidden_states[{resolved_idx}], but only {total} hidden states are available."
                     )
                 resolved_layers[layer] = resolved_idx
         attention_mask = enc.get("attention_mask")
@@ -337,7 +345,7 @@ def collect_layer_activations(
         token_counts.extend(valid_tokens.sum(dim=1).cpu().tolist())
         for layer in ordered_layers:
             idx = resolved_layers[layer]
-            layer_states = hidden_states[idx]                 # [batch, seq, hidden]
+            layer_states = hidden_states[idx]                 # [batch, seq, hidden], output of model.layers[layer]
             token_activations = layer_states[valid_tokens]    # [batch*seq_valid, hidden]
             buckets[layer].append(token_activations.float().cpu())
 

@@ -6,7 +6,7 @@
 #SBATCH --time=23:59:00
 #SBATCH --gres=gpu:a100:1
 #SBATCH --job-name=train_probes
-#SBATCH --array=0-207
+#SBATCH --array=0-15
 
 set -euo pipefail
 
@@ -46,7 +46,6 @@ MODEL="${MODEL:-meta-llama/Meta-Llama-3-8B-Instruct}"
 DATA="${DATA:-data/LLM_mini.csv}"
 LABELS=(${LABELS_OVERRIDE:-i we female prosocial differ clout polite negate shehe risk gender level trait belief question type pronoun answered})
 LAYERS=(${LAYERS_OVERRIDE:-0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31})
-AE_ROOT="${AE_ROOT:-artifacts/autoencoders}"
 PROBE_ROOT="${PROBE_ROOT:-artifacts/probes}"
 BATCH_SIZE="${BATCH_SIZE:-4}"
 MAX_LENGTH="${MAX_LENGTH:-1024}"
@@ -61,7 +60,7 @@ LABEL_CHUNK_SIZE="${LABEL_CHUNK_SIZE:-0}"
 LAYER_CHUNK_SIZE="${LAYER_CHUNK_SIZE:-2}"
 
 TASK_ID="${SLURM_ARRAY_TASK_ID:-}"
-VERSION="${VERSION_OVERRIDE:-${TASK_ID:-}}"
+VERSION="${VERSION_OVERRIDE:-}"
 START_TIME=$(date +%s)
 
 LABEL_COUNT=${#LABELS[@]}
@@ -78,32 +77,17 @@ else
   LAYER_CHUNK_COUNT=1
 fi
 
-FIRST_LAYER="${LAYERS[0]}"
-AE_LIST_FIRST=("baseline")
-AE_FOUND_FIRST=$(cd "${FE_ROOT}" && PYTHONPATH=$(pwd) python -m scripts.list_autoencoder_artifacts \
-  --model-name "$MODEL" \
-  --layer "$FIRST_LAYER" \
-  --output-dir "$AE_ROOT")
-if [ -n "${AE_FOUND_FIRST}" ]; then
-  while IFS= read -r line; do
-    [ -n "$line" ] && AE_LIST_FIRST+=("$line")
-  done <<< "${AE_FOUND_FIRST}"
-fi
-AE_COUNT=${#AE_LIST_FIRST[@]}
-
-TOTAL_JOBS=$(( AE_COUNT * LAYER_CHUNK_COUNT * LABEL_CHUNK_COUNT ))
-echo "[train_probes] total_jobs=${TOTAL_JOBS} (AE=${AE_COUNT}, layer_chunks=${LAYER_CHUNK_COUNT}, label_chunks=${LABEL_CHUNK_COUNT})"
+TOTAL_JOBS=$(( LAYER_CHUNK_COUNT * LABEL_CHUNK_COUNT ))
+echo "[train_probes] total_jobs=${TOTAL_JOBS} (raw linear only, layer_chunks=${LAYER_CHUNK_COUNT}, label_chunks=${LABEL_CHUNK_COUNT})"
 if [ -n "${TASK_ID}" ]; then
   if [ "${TASK_ID}" -ge "${TOTAL_JOBS}" ]; then
-    echo "[train_probes] SLURM_ARRAY_TASK_ID=${TASK_ID} exceeds variants=${TOTAL_JOBS} (AE=${AE_COUNT}, layer_chunks=${LAYER_CHUNK_COUNT}, label_chunks=${LABEL_CHUNK_COUNT})" >&2
+    echo "[train_probes] SLURM_ARRAY_TASK_ID=${TASK_ID} exceeds variants=${TOTAL_JOBS} (layer_chunks=${LAYER_CHUNK_COUNT}, label_chunks=${LABEL_CHUNK_COUNT})" >&2
     exit 1
   fi
-  AE_IDX=$((TASK_ID / (LAYER_CHUNK_COUNT * LABEL_CHUNK_COUNT)))
-  REM=$((TASK_ID % (LAYER_CHUNK_COUNT * LABEL_CHUNK_COUNT)))
+  REM="${TASK_ID}"
   LAYER_CHUNK_IDX=$((REM / LABEL_CHUNK_COUNT))
   LABEL_CHUNK_IDX=$((REM % LABEL_CHUNK_COUNT))
 else
-  AE_IDX=0
   LAYER_CHUNK_IDX=0
   LABEL_CHUNK_IDX=0
 fi
@@ -134,53 +118,27 @@ else
   LABEL_SUB=("${LABELS[@]}")
 fi
 
-AE_SELECTED="${AE_LIST_FIRST[$AE_IDX]}"
+echo "[train_probes] layer_subset=${LAYER_SUB[*]} label_subset=${LABEL_SUB[*]} standardizer=identity probe_type=linear version=${VERSION:-next}"
 
-if [ "${AE_SELECTED}" = "baseline" ]; then
-  (cd "${FE_ROOT}" && PYTHONPATH=$(pwd) python -m scripts.train_probes \
-    --model-name "$MODEL" \
-    --data-path "$DATA" \
-    --label-columns "${LABEL_SUB[@]}" \
-    --layers "${LAYER_SUB[@]}" \
-    --batch-size "$BATCH_SIZE" \
-    --max-length "$MAX_LENGTH" \
-    --dtype "$DTYPE" \
-    --standardizer identity \
-    --probe-type linear \
-    --logistic-penalty "$LOGISTIC_PENALTY" \
-    --logistic-C "$LOGISTIC_C" \
-    --logistic-max-iter "$LOGISTIC_MAX_ITER" \
-    --tqdm \
-    --val-size "$VAL_SIZE" \
-    --test-size "$TEST_SIZE" \
-    --random-state "$RANDOM_STATE" \
-    ${VERSION:+--version "$VERSION"} \
-    --artifact-root "$PROBE_ROOT")
-else
-  AE_LABEL=$(basename "$(dirname "$(dirname "${AE_SELECTED}")")")
-  (cd "${FE_ROOT}" && PYTHONPATH=$(pwd) python -m scripts.train_probes \
-    --model-name "$MODEL" \
-    --data-path "$DATA" \
-    --label-columns "${LABEL_SUB[@]}" \
-    --layers "${LAYER_SUB[@]}" \
-    --batch-size "$BATCH_SIZE" \
-    --max-length "$MAX_LENGTH" \
-    --dtype "$DTYPE" \
-    --standardizer autoencoder \
-    --autoencoder-root "$AE_ROOT" \
-    --autoencoder-label-filter "$AE_LABEL" \
-    --autoencoder-version "latest" \
-    --probe-type linear \
-    --logistic-penalty "$LOGISTIC_PENALTY" \
-    --logistic-C "$LOGISTIC_C" \
-    --logistic-max-iter "$LOGISTIC_MAX_ITER" \
-    --tqdm \
-    --val-size "$VAL_SIZE" \
-    --test-size "$TEST_SIZE" \
-    --random-state "$RANDOM_STATE" \
-    ${VERSION:+--version "$VERSION"} \
-    --artifact-root "$PROBE_ROOT")
-fi
+(cd "${FE_ROOT}" && PYTHONPATH=$(pwd) python -m scripts.train_probes \
+  --model-name "$MODEL" \
+  --data-path "$DATA" \
+  --label-columns "${LABEL_SUB[@]}" \
+  --layers "${LAYER_SUB[@]}" \
+  --batch-size "$BATCH_SIZE" \
+  --max-length "$MAX_LENGTH" \
+  --dtype "$DTYPE" \
+  --standardizer identity \
+  --probe-type linear \
+  --logistic-penalty "$LOGISTIC_PENALTY" \
+  --logistic-C "$LOGISTIC_C" \
+  --logistic-max-iter "$LOGISTIC_MAX_ITER" \
+  --tqdm \
+  --val-size "$VAL_SIZE" \
+  --test-size "$TEST_SIZE" \
+  --random-state "$RANDOM_STATE" \
+  ${VERSION:+--version "$VERSION"} \
+  --artifact-root "$PROBE_ROOT")
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))

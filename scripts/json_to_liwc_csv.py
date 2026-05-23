@@ -4,11 +4,17 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 from typing import Iterable
 
 
 DEFAULT_TEXT_FIELDS = ("baseline_generation", "intervened_generation")
+
+
+EXPERIMENT_RE = re.compile(
+    r".*?_L(?P<layer>\d+)_(?P<mode>increase|decrease|project)_(?P<strength>[\dpm]+)$"
+)
 
 
 def load_json_records(path: Path) -> list[dict]:
@@ -30,10 +36,30 @@ def iter_liwc_rows(
     records: list[dict],
     *,
     source_file: Path,
+    root: Path | None,
     text_fields: Iterable[str],
     include_empty: bool,
 ) -> Iterable[dict[str, object]]:
     stem = source_file.stem
+    run_dir = source_file.parent
+    experiment_dir = run_dir.parent
+    experiment_name = experiment_dir.name
+    version = run_dir.name
+    rel_source_path = str(source_file)
+    rel_run_dir = str(run_dir)
+    if root is not None:
+        try:
+            rel_source_path = str(source_file.resolve().relative_to(root.resolve()))
+            rel_run_dir = str(run_dir.resolve().relative_to(root.resolve()))
+        except ValueError:
+            pass
+
+    parsed = EXPERIMENT_RE.match(experiment_name)
+    intervention_layer = parsed.group("layer") if parsed else ""
+    intervention_mode = parsed.group("mode") if parsed else ""
+    intervention_strength = parsed.group("strength").replace("p", ".").replace("m", "-") if parsed else ""
+    generation_condition = stem.replace("generations_", "")
+
     for record_index, record in enumerate(records):
         prompt = record.get("prompt", "")
         tag = record.get("tag", "")
@@ -50,6 +76,15 @@ def iter_liwc_rows(
 
             yield {
                 "source_file": source_file.name,
+                "source_path": rel_source_path,
+                "source_path_abs": str(source_file.resolve()),
+                "run_dir": rel_run_dir,
+                "experiment_name": experiment_name,
+                "version": version,
+                "generation_condition": generation_condition,
+                "intervention_layer": intervention_layer,
+                "intervention_mode": intervention_mode,
+                "intervention_strength": intervention_strength,
                 "record_index": record_index,
                 "text_id": f"{stem}_{record_index}_{text_field}",
                 "text_kind": text_field,
@@ -90,6 +125,12 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep rows whose text field is empty.",
     )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=None,
+        help="Optional root used to make source_path and run_dir relative.",
+    )
     return parser
 
 
@@ -102,6 +143,15 @@ def main() -> None:
 
     fieldnames = [
         "source_file",
+        "source_path",
+        "source_path_abs",
+        "run_dir",
+        "experiment_name",
+        "version",
+        "generation_condition",
+        "intervention_layer",
+        "intervention_mode",
+        "intervention_strength",
         "record_index",
         "text_id",
         "text_kind",
@@ -121,6 +171,7 @@ def main() -> None:
             for row in iter_liwc_rows(
                 records,
                 source_file=input_path,
+                root=args.root,
                 text_fields=args.text_fields,
                 include_empty=args.include_empty,
             ):
